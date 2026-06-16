@@ -1,18 +1,24 @@
-const { Bot } = require('grammy');
-const { FileStore } = require('./store/fileStore');
-const { isChatAdmin, isGroupChat } = require('./services/admin');
-const { parseAction } = require('./services/parser');
-const {
+import { Bot } from 'grammy';
+import { FileStore } from './store/fileStore.js';
+import { isChatAdmin, isGroupChat } from './services/admin.js';
+import { parseAction } from './services/parser.js';
+import {
   addGifFromReply,
   addStickerPackFromName,
   addStickerPackFromReply
-} = require('./services/mediaPool');
+} from './services/mediaPool.js';
 
 function createBot(config) {
   const bot = new Bot(config.token);
   const store = new FileStore(config.dataFilePath);
+  let started = false;
+  let pollingPromise = null;
 
   async function start() {
+    if (started) {
+      return;
+    }
+
     await store.load();
 
     bot.on('message', async (ctx) => {
@@ -23,8 +29,22 @@ function createBot(config) {
       console.error('Telegram bot error:', error.error);
     });
 
+    started = true;
+    pollingPromise = bot.start();
+    pollingPromise.catch((error) => {
+      console.error('Armaturina polling stopped with error:', error);
+    });
+
     console.log('Armaturina bot started.');
-    await bot.start();
+  }
+
+  async function stop() {
+    if (!started) {
+      return;
+    }
+
+    await bot.stop();
+    started = false;
   }
 
   async function handleMessage(message) {
@@ -167,11 +187,15 @@ function createBot(config) {
 
   return {
     start,
+    stop,
     bot,
-    store
+    store,
+    get pollingPromise() {
+      return pollingPromise;
+    }
   };
 }
 
-module.exports = {
+export {
   createBot
 };

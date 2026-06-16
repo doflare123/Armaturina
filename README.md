@@ -5,12 +5,33 @@
 ## Запуск
 
 1. Создай бота через BotFather и выключи ему privacy mode: `Bot Settings` -> `Group Privacy` -> `Turn off`.
-2. Скопируй `.env.example` в `.env` и укажи `BOT_TOKEN`.
+2. Скопируй `.env.example` в `.env` и укажи `ARMATURINA_BOT_TOKEN`.
 3. Установи зависимости и запусти:
 
 ```bash
 npm install
 npm start
+```
+
+Если в одном контейнере запускается несколько ботов, можно импортировать Арматурину в главный ESM-файл:
+
+```js
+import { armaturina } from './armaturina/src/index.js';
+
+await armaturina();
+```
+
+`armaturina()` не блокирует запуск остальных ботов: она поднимает polling в фоне и возвращает инстанс после загрузки файла с пулом.
+
+Если не хочешь использовать env-переменные, передай настройки явно:
+
+```js
+import { armaturina } from './armaturina/src/index.js';
+
+await armaturina({
+  token: process.env.ARMATURINA_BOT_TOKEN,
+  dataFilePath: './armaturina/data/media-pool.json'
+});
 ```
 
 ## Команды и фразы

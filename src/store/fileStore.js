@@ -1,6 +1,6 @@
-const fs = require('fs/promises');
-const path = require('path');
-const { MemoryStore } = require('./memoryStore');
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { MemoryStore } from './memoryStore.js';
 
 class FileStore extends MemoryStore {
   constructor(filePath) {
@@ -48,6 +48,6 @@ class FileStore extends MemoryStore {
   }
 }
 
-module.exports = {
+export {
   FileStore
 };

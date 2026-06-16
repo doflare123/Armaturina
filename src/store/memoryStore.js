@@ -120,7 +120,7 @@ function normalizeUsername(username) {
   return String(username).replace(/^@/, '').toLowerCase();
 }
 
-module.exports = {
+export {
   MemoryStore,
   normalizeUsername
 };

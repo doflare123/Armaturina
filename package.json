@@ -2,6 +2,7 @@
   "name": "armaturina-bot",
   "version": "1.0.0",
   "description": "Admin-only Telegram group bot for random sticker/GIF replies.",
+  "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",

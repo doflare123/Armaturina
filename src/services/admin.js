@@ -8,7 +8,7 @@ async function isChatAdmin(api, chatId, userId) {
   return member.status === 'administrator' || member.status === 'creator';
 }
 
-module.exports = {
+export {
   isGroupChat,
   isChatAdmin
 };

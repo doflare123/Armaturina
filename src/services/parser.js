@@ -84,7 +84,7 @@ function extractStickerPackName(text) {
   return possiblePackNames[possiblePackNames.length - 1] || null;
 }
 
-module.exports = {
+export {
   getMessageText,
   parseAction
 };

@@ -33,7 +33,7 @@ async function addGifFromReply(store, message) {
   };
 }
 
-module.exports = {
+export {
   addStickerPackFromName,
   addStickerPackFromReply,
   addGifFromReply
