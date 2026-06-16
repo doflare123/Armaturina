@@ -6,36 +6,66 @@ class MemoryStore {
     this.stickerSets = new Set();
 
     // Last messages are chat-scoped because replies must happen in the same group.
-    this.lastMessagesByChat = new Map();
+    this.lastMessagesByUsernameByChat = new Map();
+    this.lastMessagesByUserIdByChat = new Map();
   }
 
   rememberMessage(message) {
-    if (!message.from || !message.from.username || !message.chat) {
+    if (!message.from || !message.chat) {
       return;
     }
 
     const chatId = message.chat.id;
-    const username = normalizeUsername(message.from.username);
-
-    if (!this.lastMessagesByChat.has(chatId)) {
-      this.lastMessagesByChat.set(chatId, new Map());
-    }
-
-    this.lastMessagesByChat.get(chatId).set(username, {
+    const lastMessage = {
       messageId: message.message_id,
       userId: message.from.id,
-      username
-    });
+      username: message.from.username ? normalizeUsername(message.from.username) : null
+    };
+
+    if (!this.lastMessagesByUserIdByChat.has(chatId)) {
+      this.lastMessagesByUserIdByChat.set(chatId, new Map());
+    }
+
+    this.lastMessagesByUserIdByChat.get(chatId).set(message.from.id, lastMessage);
+
+    if (!message.from.username) {
+      return;
+    }
+
+    if (!this.lastMessagesByUsernameByChat.has(chatId)) {
+      this.lastMessagesByUsernameByChat.set(chatId, new Map());
+    }
+
+    this.lastMessagesByUsernameByChat
+      .get(chatId)
+      .set(normalizeUsername(message.from.username), lastMessage);
   }
 
-  getLastMessage(chatId, username) {
-    const chatMessages = this.lastMessagesByChat.get(chatId);
+  getLastMessage(chatId, target) {
+    if (!target) {
+      return null;
+    }
+
+    if (target.userId) {
+      const userIdMessages = this.lastMessagesByUserIdByChat.get(chatId);
+      const message = userIdMessages && userIdMessages.get(target.userId);
+
+      if (message) {
+        return message;
+      }
+    }
+
+    if (!target.username) {
+      return null;
+    }
+
+    const chatMessages = this.lastMessagesByUsernameByChat.get(chatId);
 
     if (!chatMessages) {
       return null;
     }
 
-    return chatMessages.get(normalizeUsername(username)) || null;
+    return chatMessages.get(normalizeUsername(target.username)) || null;
   }
 
   addStickerSet(setName, stickers) {

@@ -47,16 +47,66 @@ function parseAction(message) {
     };
   }
 
-  const usernameMatch = text.match(USERNAME_RE);
+  const mentionTarget = extractMentionTarget(message, text);
 
-  if (usernameMatch) {
+  if (mentionTarget) {
     return {
       type: 'hit',
-      username: usernameMatch[1]
+      target: mentionTarget
     };
   }
 
   return { type: 'none' };
+}
+
+function extractMentionTarget(message, text) {
+  const entityTarget = extractMentionTargetFromEntities(message, text);
+
+  if (entityTarget) {
+    return entityTarget;
+  }
+
+  const usernameMatch = text.match(USERNAME_RE);
+
+  if (!usernameMatch) {
+    return null;
+  }
+
+  return {
+    type: 'username',
+    username: usernameMatch[1],
+    label: `@${usernameMatch[1]}`
+  };
+}
+
+function extractMentionTargetFromEntities(message, text) {
+  const entities = message.entities || message.caption_entities || [];
+
+  for (const entity of entities) {
+    if (entity.type === 'text_mention' && entity.user) {
+      return {
+        type: 'user_id',
+        userId: entity.user.id,
+        username: entity.user.username || null,
+        label: entity.user.username ? `@${entity.user.username}` : entity.user.first_name
+      };
+    }
+
+    if (entity.type === 'mention') {
+      const mention = text.slice(entity.offset, entity.offset + entity.length);
+      const usernameMatch = mention.match(USERNAME_RE);
+
+      if (usernameMatch) {
+        return {
+          type: 'username',
+          username: usernameMatch[1],
+          label: `@${usernameMatch[1]}`
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
 function isAddGifText(lowerText) {

@@ -1,6 +1,6 @@
 import { Bot } from 'grammy';
 import { FileStore } from './store/fileStore.js';
-import { isChatAdmin, isGroupChat } from './services/admin.js';
+import { AdminChecker, isGroupChat } from './services/admin.js';
 import { parseAction } from './services/parser.js';
 import {
   addGifFromReply,
@@ -11,6 +11,7 @@ import {
 function createBot(config) {
   const bot = new Bot(config.token);
   const store = new FileStore(config.dataFilePath);
+  const adminChecker = new AdminChecker(bot.api);
   let started = false;
   let pollingPromise = null;
 
@@ -71,7 +72,7 @@ function createBot(config) {
   }
 
   async function handleAdminAction(message, action) {
-    const admin = await isChatAdmin(bot.api, message.chat.id, message.from.id);
+    const admin = await canUseAdminAction(message);
 
     if (!admin) {
       return;
@@ -98,7 +99,22 @@ function createBot(config) {
     }
 
     if (action.type === 'hit') {
-      await handleHit(message, action.username);
+      await handleHit(message, action.target);
+    }
+  }
+
+  async function canUseAdminAction(message) {
+    try {
+      return await adminChecker.isChatAdmin(message);
+    } catch (error) {
+      console.error('Failed to check chat administrators:', error);
+
+      await bot.api.sendMessage(
+        message.chat.id,
+        'Не могу проверить права админа. Дай боту права администратора в группе, иначе Telegram не отдает список админов.'
+      );
+
+      return false;
     }
   }
 
@@ -133,13 +149,14 @@ function createBot(config) {
     await bot.api.sendMessage(message.chat.id, 'GIF добавлена в арматурный пул.');
   }
 
-  async function handleHit(message, username) {
-    const targetMessage = store.getLastMessage(message.chat.id, username);
+  async function handleHit(message, target) {
+    const targetMessage = store.getLastMessage(message.chat.id, target);
+    const targetLabel = target && target.label ? target.label : 'цели';
 
     if (!targetMessage) {
       await bot.api.sendMessage(
         message.chat.id,
-        `Не нашла последнее сообщение @${username}. Сначала этот человек должен что-нибудь написать в группе.`
+        `Не нашла последнее сообщение ${targetLabel}. Сначала этот человек должен что-нибудь написать в группе.`
       );
       return;
     }
