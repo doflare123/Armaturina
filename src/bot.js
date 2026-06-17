@@ -8,6 +8,8 @@ import {
   addStickerPackFromReply
 } from './services/mediaPool.js';
 
+const ULTRA_HIT_CHANCE = 0.01;
+
 function createBot(config) {
   const bot = new Bot(config.token);
   const store = new FileStore(config.dataFilePath);
@@ -56,6 +58,12 @@ function createBot(config) {
 
     const action = parseAction(message);
 
+    if (isPublicAction(action)) {
+      await handlePublicAction(message, action);
+      store.rememberMessage(message);
+      return;
+    }
+
     if (action.type !== 'none') {
       await handleAdminAction(message, action);
     }
@@ -89,17 +97,32 @@ function createBot(config) {
     }
 
     if (action.type === 'add_sticker_pack') {
-      await handleAddStickerPack(message, action.packName);
+      await handleAddStickerPack(message, action.packName, action.pool);
       return;
     }
 
     if (action.type === 'add_gif') {
-      await handleAddGif(message);
+      await handleAddGif(message, action.pool);
       return;
     }
 
     if (action.type === 'hit') {
       await handleHit(message, action.target);
+    }
+  }
+
+  function isPublicAction(action) {
+    return action.type === 'stats' || action.type === 'top';
+  }
+
+  async function handlePublicAction(message, action) {
+    if (action.type === 'stats') {
+      await sendStats(message.chat.id);
+      return;
+    }
+
+    if (action.type === 'top') {
+      await sendTop(message.chat.id);
     }
   }
 
@@ -118,11 +141,11 @@ function createBot(config) {
     }
   }
 
-  async function handleAddStickerPack(message, packName) {
+  async function handleAddStickerPack(message, packName, pool = 'regular') {
     try {
       const result = packName
-        ? await addStickerPackFromName(bot.api, store, packName)
-        : await addStickerPackFromReply(bot.api, store, message);
+        ? await addStickerPackFromName(bot.api, store, packName, pool)
+        : await addStickerPackFromReply(bot.api, store, message, pool);
 
       if (!result) {
         await bot.api.sendMessage(message.chat.id, 'Ответь на стикер или укажи имя стикерпака.');
@@ -131,22 +154,22 @@ function createBot(config) {
 
       await bot.api.sendMessage(
         message.chat.id,
-        `Стикерпак ${result.setName} добавлен. Стикеров в пуле: +${result.addedCount}.`
+        `Стикерпак ${result.setName} добавлен в ${getPoolLabel(pool)} пул. Стикеров: +${result.addedCount}.`
       );
     } catch (error) {
       await bot.api.sendMessage(message.chat.id, `Не смогла добавить стикерпак: ${error.message}`);
     }
   }
 
-  async function handleAddGif(message) {
-    const result = await addGifFromReply(store, message);
+  async function handleAddGif(message, pool = 'regular') {
+    const result = await addGifFromReply(store, message, pool);
 
     if (!result) {
       await bot.api.sendMessage(message.chat.id, 'Ответь командой на GIF/animation, которую нужно добавить.');
       return;
     }
 
-    await bot.api.sendMessage(message.chat.id, 'GIF добавлена в арматурный пул.');
+    await bot.api.sendMessage(message.chat.id, `GIF добавлена в ${getPoolLabel(pool)} пул.`);
   }
 
   async function handleHit(message, target) {
@@ -167,7 +190,8 @@ function createBot(config) {
       return;
     }
 
-    const media = store.getRandomMedia();
+    const isUltra = Math.random() < ULTRA_HIT_CHANCE && store.hasMedia('ultra');
+    const media = store.getRandomMedia(isUltra ? 'ultra' : 'regular');
 
     if (!media) {
       await bot.api.sendMessage(message.chat.id, 'Пул пустой. Админ должен добавить стикерпак или GIF.');
@@ -179,12 +203,18 @@ function createBot(config) {
       allow_sending_without_reply: true
     };
 
+    if (isUltra) {
+      await bot.api.sendMessage(message.chat.id, 'УЛЬТРА УДАР ПО ХРЕПТИНЕ', options);
+    }
+
     if (media.type === 'sticker') {
       await bot.api.sendSticker(message.chat.id, media.fileId, options);
+      await store.recordHit(message.chat.id, buildStatsTarget(target, targetMessage), isUltra);
       return;
     }
 
     await bot.api.sendAnimation(message.chat.id, media.fileId, options);
+    await store.recordHit(message.chat.id, buildStatsTarget(target, targetMessage), isUltra);
   }
 
   async function sendHelp(chatId) {
@@ -193,8 +223,12 @@ function createBot(config) {
       '',
       'Ударить: Арматурина, дай по хрептине @username',
       'Добавить стикерпак: /addstickerpack pack_name',
+      'Добавить ultra стикерпак: /addultrastickerpack pack_name',
       'Добавить пак из стикера: ответь на стикер фразой "Арматурина, добавь стикерпак"',
       'Добавить GIF: ответь на GIF фразой "Арматурина, добавь гифку" или /addgif',
+      'Добавить ultra GIF: ответь на GIF командой /addultragif',
+      'Статистика: /stats',
+      'Топ недели: /top',
       'Пул: /pool'
     ].join('\n'));
   }
@@ -204,8 +238,44 @@ function createBot(config) {
 
     await bot.api.sendMessage(
       chatId,
-      `Пул: ${stats.stickerSets} стикерпаков, ${stats.stickers} стикеров, ${stats.animations} GIF.`
+      `Пул: ${stats.stickerSets} стикерпаков, ${stats.stickers} стикеров, ${stats.animations} GIF.\nUltra-пул: ${stats.ultraStickerSets} стикерпаков, ${stats.ultraStickers} стикеров, ${stats.ultraAnimations} GIF.`
     );
+  }
+
+  async function sendStats(chatId) {
+    const stats = store.getChatStats(chatId);
+    const leaderLine = stats.leader
+      ? `Почетная хрептина недели: ${stats.leader.label} (${stats.leader.weeklyHits})`
+      : 'Почетная хрептина недели пока не выбрана.';
+
+    await bot.api.sendMessage(chatId, [
+      'Арматурная статистика:',
+      `Всего ударов: ${stats.totalHits}`,
+      `Ультра ударов: ${stats.ultraHits}`,
+      `Уникальных хрептин: ${stats.uniqueVictims}`,
+      `Ударов за неделю ${stats.weekKey}: ${stats.weekHits}`,
+      leaderLine
+    ].join('\n'));
+  }
+
+  async function sendTop(chatId) {
+    const top = store.getWeeklyTop(chatId, 10);
+
+    if (top.length === 0) {
+      await bot.api.sendMessage(chatId, 'Почетная хрептина недели пока не выявлена.');
+      return;
+    }
+
+    const lines = top.map((victim, index) => {
+      const ultraText = victim.ultraHits > 0 ? `, ultra: ${victim.ultraHits}` : '';
+
+      return `${index + 1}. ${victim.label} — ${victim.weeklyHits}${ultraText}`;
+    });
+
+    await bot.api.sendMessage(chatId, [
+      'Топ недели: Почетная хрептина недели',
+      ...lines
+    ].join('\n'));
   }
 
   return {
@@ -217,6 +287,21 @@ function createBot(config) {
       return pollingPromise;
     }
   };
+}
+
+function buildStatsTarget(target, targetMessage) {
+  const username = target.username || targetMessage.username || null;
+  const userId = target.userId || targetMessage.userId || null;
+
+  return {
+    userId,
+    username,
+    label: target.label || (username ? `@${username}` : `id:${userId}`)
+  };
+}
+
+function getPoolLabel(pool) {
+  return pool === 'ultra' ? 'ultra' : 'обычный';
 }
 
 export {

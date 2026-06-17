@@ -35,15 +35,20 @@ class FileStore extends MemoryStore {
     await fs.rename(temporaryPath, this.filePath);
   }
 
-  async addStickerSet(setName, stickers) {
-    const addedCount = super.addStickerSet(setName, stickers);
+  async addStickerSet(setName, stickers, pool = 'regular') {
+    const addedCount = super.addStickerSet(setName, stickers, pool);
     await this.save();
 
     return addedCount;
   }
 
-  async addAnimation(fileId) {
-    super.addAnimation(fileId);
+  async addAnimation(fileId, pool = 'regular') {
+    super.addAnimation(fileId, pool);
+    await this.save();
+  }
+
+  async recordHit(chatId, target, isUltra = false) {
+    super.recordHit(chatId, target, isUltra);
     await this.save();
   }
 }

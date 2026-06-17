@@ -21,14 +21,35 @@ function parseAction(message) {
     return { type: 'pool' };
   }
 
+  if (lowerText.startsWith('/stats')) {
+    return { type: 'stats' };
+  }
+
+  if (lowerText.startsWith('/top')) {
+    return { type: 'top' };
+  }
+
+  if (lowerText.startsWith('/addultragif')) {
+    return { type: 'add_gif', pool: 'ultra' };
+  }
+
+  if (lowerText.startsWith('/addultrastickerpack')) {
+    return {
+      type: 'add_sticker_pack',
+      packName: text.split(/\s+/)[1] || null,
+      pool: 'ultra'
+    };
+  }
+
   if (lowerText.startsWith('/addgif')) {
-    return { type: 'add_gif' };
+    return { type: 'add_gif', pool: 'regular' };
   }
 
   if (lowerText.startsWith('/addstickerpack')) {
     return {
       type: 'add_sticker_pack',
-      packName: text.split(/\s+/)[1] || null
+      packName: text.split(/\s+/)[1] || null,
+      pool: 'regular'
     };
   }
 
@@ -37,13 +58,14 @@ function parseAction(message) {
   }
 
   if (isAddGifText(lowerText)) {
-    return { type: 'add_gif' };
+    return { type: 'add_gif', pool: getRequestedPool(lowerText) };
   }
 
   if (isAddStickerPackText(lowerText)) {
     return {
       type: 'add_sticker_pack',
-      packName: extractStickerPackName(text)
+      packName: extractStickerPackName(text),
+      pool: getRequestedPool(lowerText)
     };
   }
 
@@ -144,6 +166,10 @@ function isAddStickerPackText(lowerText) {
     lowerText.includes('стикер пак') ||
     lowerText.includes('пак')
   );
+}
+
+function getRequestedPool(lowerText) {
+  return lowerText.includes('ультра') || lowerText.includes('ultra') ? 'ultra' : 'regular';
 }
 
 function extractStickerPackName(text) {
