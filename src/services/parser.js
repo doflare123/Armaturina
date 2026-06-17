@@ -56,6 +56,15 @@ function parseAction(message) {
     };
   }
 
+  const replyTarget = extractReplyTarget(message);
+
+  if (replyTarget) {
+    return {
+      type: 'hit',
+      target: replyTarget
+    };
+  }
+
   return { type: 'none' };
 }
 
@@ -107,6 +116,22 @@ function extractMentionTargetFromEntities(message, text) {
   }
 
   return null;
+}
+
+function extractReplyTarget(message) {
+  const reply = message.reply_to_message;
+
+  if (!reply || !reply.from) {
+    return null;
+  }
+
+  return {
+    type: 'reply',
+    userId: reply.from.id,
+    username: reply.from.username || null,
+    messageId: reply.message_id,
+    label: reply.from.username ? `@${reply.from.username}` : reply.from.first_name
+  };
 }
 
 function isAddGifText(lowerText) {

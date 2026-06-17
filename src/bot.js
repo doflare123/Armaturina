@@ -150,7 +150,13 @@ function createBot(config) {
   }
 
   async function handleHit(message, target) {
-    const targetMessage = store.getLastMessage(message.chat.id, target);
+    const targetMessage = target && target.messageId
+      ? {
+          messageId: target.messageId,
+          userId: target.userId,
+          username: target.username
+        }
+      : store.getLastMessage(message.chat.id, target);
     const targetLabel = target && target.label ? target.label : 'цели';
 
     if (!targetMessage) {
