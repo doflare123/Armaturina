@@ -9,6 +9,8 @@ import {
 } from './services/mediaPool.js';
 
 const ULTRA_HIT_CHANCE = 0.01;
+const ULTRA_CHARGE_STEPS = [0, 20, 40, 60, 80, 100];
+const ULTRA_CHARGE_STEP_DELAY_MS = 650;
 
 function createBot(config) {
   const bot = new Bot(config.token);
@@ -204,7 +206,7 @@ function createBot(config) {
     };
 
     if (isUltra) {
-      await bot.api.sendMessage(message.chat.id, 'УЛЬТРА УДАР ПО ХРЕПТИНЕ', options);
+      await playUltraCharge(message.chat.id, options);
     }
 
     if (media.type === 'sticker') {
@@ -278,6 +280,37 @@ function createBot(config) {
     ].join('\n'));
   }
 
+  async function playUltraCharge(chatId, options) {
+    let chargeMessage = null;
+
+    try {
+      chargeMessage = await bot.api.sendMessage(
+        chatId,
+        buildUltraChargeText(0),
+        options
+      );
+
+      for (const percent of ULTRA_CHARGE_STEPS.slice(1)) {
+        await delay(ULTRA_CHARGE_STEP_DELAY_MS);
+
+        await bot.api.editMessageText(
+          chatId,
+          chargeMessage.message_id,
+          buildUltraChargeText(percent)
+        );
+      }
+
+      await delay(ULTRA_CHARGE_STEP_DELAY_MS);
+      await bot.api.deleteMessage(chatId, chargeMessage.message_id);
+    } catch (error) {
+      console.error('Failed to play ultra charge animation:', error);
+
+      if (chargeMessage) {
+        await bot.api.deleteMessage(chatId, chargeMessage.message_id).catch(() => {});
+      }
+    }
+  }
+
   return {
     start,
     stop,
@@ -302,6 +335,24 @@ function buildStatsTarget(target, targetMessage) {
 
 function getPoolLabel(pool) {
   return pool === 'ultra' ? 'ultra' : 'обычный';
+}
+
+function buildUltraChargeText(percent) {
+  const filledCount = Math.floor(percent / 20);
+  const emptyCount = 5 - filledCount;
+  const bar = `${'🟩'.repeat(filledCount)}${'⬛'.repeat(emptyCount)}`;
+
+  if (percent === 100) {
+    return `${bar} ${percent}%\nЛови маслину`;
+  }
+
+  return `${bar} ${percent}%\nЗарядка мега-хрептины`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 export {
