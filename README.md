@@ -75,7 +75,16 @@ Gemini анализирует стикеры/GIF при добавлении и 
 ARMATURINA_GEMINI_API_KEY=
 ARMATURINA_GEMINI_MODEL=gemini-3.5-flash
 ARMATURINA_GEMINI_MAX_TAGS_PER_PACK=30
+ARMATURINA_GEMINI_DEBUG=false
 ```
+
+Для диагностики можно включить:
+
+```bash
+ARMATURINA_GEMINI_DEBUG=true
+```
+
+Тогда в консоли будут сырой ответ Gemini, `finishReason`, safety ratings и итоговые теги.
 
 Для static `.webp` стикеров бот анализирует сам файл. Для animated `.tgs`, video stickers и GIF сначала используется Telegram thumbnail. Если thumbnail нет, медиа останется без точных визуальных тегов до более тяжелой конвертации.
 

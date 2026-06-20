@@ -72,6 +72,7 @@ class GeminiService {
     this.timeoutMs = Number(config.timeoutMs || DEFAULT_TIMEOUT_MS);
     this.telegramToken = config.telegramToken || null;
     this.maxTagsPerPack = Number(config.maxTagsPerPack || 0);
+    this.debug = Boolean(config.debug);
   }
 
   isEnabled() {
@@ -112,7 +113,15 @@ class GeminiService {
           }
         }
       ],
-      { mode: 'media' }
+      {
+        mode: 'media',
+        debugContext: {
+          kind: media.kind,
+          fileId: media.fileId,
+          analysisFileId,
+          mimeType: downloaded.mimeType
+        }
+      }
     );
 
     const metadata = normalizeMetadata({
@@ -135,6 +144,15 @@ class GeminiService {
       return createFallbackMetadata(media, 'no_gemini_tags');
     }
 
+    this.logDebug('Gemini media metadata:', {
+      fileId: media.fileId,
+      analysisFileId,
+      mimeType: downloaded.mimeType,
+      tags: metadata.tags,
+      mood: metadata.mood,
+      caption: metadata.caption
+    });
+
     return metadata;
   }
 
@@ -151,7 +169,15 @@ class GeminiService {
       `Сообщение: ${contextText.slice(0, 1000)}`
     ].join(' ');
 
-    const data = await this.generateJson([{ text: prompt }], { mode: 'context' });
+    const data = await this.generateJson(
+      [{ text: prompt }],
+      {
+        mode: 'context',
+        debugContext: {
+          context: contextText.slice(0, 240)
+        }
+      }
+    );
 
     const tags = normalizeTags(data.wantedTags || data.tags);
 
@@ -161,6 +187,11 @@ class GeminiService {
         context: contextText.slice(0, 160)
       });
     }
+
+    this.logDebug('Gemini context tags:', {
+      context: contextText.slice(0, 240),
+      tags
+    });
 
     return tags;
   }
@@ -219,6 +250,14 @@ class GeminiService {
       const geminiResponse = await response.json();
       const outputText = extractGeminiText(geminiResponse);
 
+      this.logDebug('Gemini raw response:', {
+        mode: options.mode,
+        context: options.debugContext,
+        text: outputText,
+        finishReason: geminiResponse.candidates?.[0]?.finishReason,
+        safetyRatings: geminiResponse.candidates?.[0]?.safetyRatings
+      });
+
       if (!outputText) {
         console.warn('Gemini returned empty text:', summarizeGeminiResponse(geminiResponse));
         return {};
@@ -257,6 +296,14 @@ class GeminiService {
       mimeType: inferMimeType(file.file_path, response.headers.get('content-type')),
       filePath: file.file_path
     };
+  }
+
+  logDebug(label, payload) {
+    if (!this.debug) {
+      return;
+    }
+
+    console.log(label, payload);
   }
 }
 

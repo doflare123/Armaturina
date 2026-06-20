@@ -31,9 +31,14 @@ function loadConfig(options = {}) {
       baseUrl: options.geminiBaseUrl || process.env.ARMATURINA_GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
       model: options.geminiModel || process.env.ARMATURINA_GEMINI_MODEL || 'gemini-3.5-flash',
       timeoutMs: Number(options.geminiTimeoutMs || process.env.ARMATURINA_GEMINI_TIMEOUT_MS || 12_000),
-      maxTagsPerPack: Number.isFinite(geminiMaxTagsPerPack) ? Math.max(0, geminiMaxTagsPerPack) : 30
+      maxTagsPerPack: Number.isFinite(geminiMaxTagsPerPack) ? Math.max(0, geminiMaxTagsPerPack) : 30,
+      debug: parseBoolean(options.geminiDebug ?? process.env.ARMATURINA_GEMINI_DEBUG)
     }
   };
+}
+
+function parseBoolean(value) {
+  return value === true || String(value).toLowerCase() === 'true';
 }
 
 export {
