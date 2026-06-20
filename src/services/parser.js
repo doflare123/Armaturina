@@ -33,6 +33,18 @@ function parseAction(message) {
     return { type: 'add_gif', pool: 'ultra' };
   }
 
+  if (lowerText.startsWith('/retag')) {
+    const parts = text.split(/\s+/);
+    const pool = ['regular', 'ultra', 'all'].includes(parts[1]) ? parts[1] : 'all';
+    const limit = Number(parts[2] || (pool === 'all' ? parts[1] : 25));
+
+    return {
+      type: 'retag',
+      pool,
+      limit: Number.isFinite(limit) ? Math.max(1, Math.min(100, limit)) : 25
+    };
+  }
+
   if (lowerText.startsWith('/addultrastickerpack')) {
     return {
       type: 'add_sticker_pack',
@@ -152,6 +164,7 @@ function extractReplyTarget(message) {
     userId: reply.from.id,
     username: reply.from.username || null,
     messageId: reply.message_id,
+    text: getMessageText(reply),
     label: reply.from.username ? `@${reply.from.username}` : reply.from.first_name
   };
 }

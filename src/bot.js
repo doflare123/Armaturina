@@ -1,6 +1,7 @@
 import { Bot } from 'grammy';
 import { FileStore } from './store/fileStore.js';
 import { AdminChecker, isGroupChat } from './services/admin.js';
+import { GeminiService } from './services/gemini.js';
 import { parseAction } from './services/parser.js';
 import {
   addGifFromReply,
@@ -16,6 +17,10 @@ function createBot(config) {
   const bot = new Bot(config.token);
   const store = new FileStore(config.dataFilePath);
   const adminChecker = new AdminChecker(bot.api);
+  const gemini = new GeminiService({
+    ...config.gemini,
+    telegramToken: config.token
+  });
   let started = false;
   let pollingPromise = null;
 
@@ -108,6 +113,11 @@ function createBot(config) {
       return;
     }
 
+    if (action.type === 'retag') {
+      await handleRetag(message, action.pool, action.limit);
+      return;
+    }
+
     if (action.type === 'hit') {
       await handleHit(message, action.target);
     }
@@ -145,9 +155,10 @@ function createBot(config) {
 
   async function handleAddStickerPack(message, packName, pool = 'regular') {
     try {
+      const tagger = gemini.isEnabled() ? gemini : null;
       const result = packName
-        ? await addStickerPackFromName(bot.api, store, packName, pool)
-        : await addStickerPackFromReply(bot.api, store, message, pool);
+        ? await addStickerPackFromName(bot.api, store, packName, pool, tagger)
+        : await addStickerPackFromReply(bot.api, store, message, pool, tagger);
 
       if (!result) {
         await bot.api.sendMessage(message.chat.id, 'Ответь на стикер или укажи имя стикерпака.');
@@ -156,7 +167,7 @@ function createBot(config) {
 
       await bot.api.sendMessage(
         message.chat.id,
-        `Стикерпак ${result.setName} добавлен в ${getPoolLabel(pool)} пул. Стикеров: +${result.addedCount}.`
+        `Стикерпак ${result.setName} добавлен в ${getPoolLabel(pool)} пул. Стикеров: +${result.addedCount}. Протегировано: ${result.taggedCount}.`
       );
     } catch (error) {
       await bot.api.sendMessage(message.chat.id, `Не смогла добавить стикерпак: ${error.message}`);
@@ -164,14 +175,54 @@ function createBot(config) {
   }
 
   async function handleAddGif(message, pool = 'regular') {
-    const result = await addGifFromReply(store, message, pool);
+    const tagger = gemini.isEnabled() ? gemini : null;
+    const result = await addGifFromReply(bot.api, store, message, pool, tagger);
 
     if (!result) {
       await bot.api.sendMessage(message.chat.id, 'Ответь командой на GIF/animation, которую нужно добавить.');
       return;
     }
 
-    await bot.api.sendMessage(message.chat.id, `GIF добавлена в ${getPoolLabel(pool)} пул.`);
+    await bot.api.sendMessage(
+      message.chat.id,
+      `GIF добавлена в ${getPoolLabel(pool)} пул.${result.tagged ? ' Теги на месте.' : ''}`
+    );
+  }
+
+  async function handleRetag(message, pool, limit) {
+    if (!gemini.isEnabled()) {
+      await bot.api.sendMessage(message.chat.id, 'Gemini выключен: укажи ARMATURINA_GEMINI_API_KEY.');
+      return;
+    }
+
+    const pools = pool === 'all' ? ['regular', 'ultra'] : [pool];
+    let tagged = 0;
+    let seen = 0;
+
+    for (const currentPool of pools) {
+      const mediaItems = store.getUntaggedMedia(currentPool, limit - seen);
+
+      for (const media of mediaItems) {
+        seen += 1;
+
+        const metadata = await gemini.tagTelegramMedia(bot.api, {
+          kind: media.type,
+          fileId: media.fileId,
+          thumbnailFileId: media.analysisFileId
+        });
+
+        await store.updateMediaMetadata(media.fileId, currentPool, metadata);
+
+        if (metadata.tags && metadata.tags.length > 0) {
+          tagged += 1;
+        }
+      }
+    }
+
+    await bot.api.sendMessage(
+      message.chat.id,
+      `Ретег готов. Проверено: ${seen}, протегировано: ${tagged}.`
+    );
   }
 
   async function handleHit(message, target) {
@@ -179,7 +230,8 @@ function createBot(config) {
       ? {
           messageId: target.messageId,
           userId: target.userId,
-          username: target.username
+          username: target.username,
+          text: target.text || ''
         }
       : store.getLastMessage(message.chat.id, target);
     const targetLabel = target && target.label ? target.label : 'цели';
@@ -193,7 +245,9 @@ function createBot(config) {
     }
 
     const isUltra = Math.random() < ULTRA_HIT_CHANCE && store.hasMedia('ultra');
-    const media = store.getRandomMedia(isUltra ? 'ultra' : 'regular');
+    const pool = isUltra ? 'ultra' : 'regular';
+    const wantedTags = await gemini.selectTagsForContext(getHitContextText(message, targetMessage));
+    const media = store.getBestMediaByTags(pool, wantedTags) || store.getRandomMedia(pool);
 
     if (!media) {
       await bot.api.sendMessage(message.chat.id, 'Пул пустой. Админ должен добавить стикерпак или GIF.');
@@ -240,7 +294,7 @@ function createBot(config) {
 
     await bot.api.sendMessage(
       chatId,
-      `Пул: ${stats.stickerSets} стикерпаков, ${stats.stickers} стикеров, ${stats.animations} GIF.\nUltra-пул: ${stats.ultraStickerSets} стикерпаков, ${stats.ultraStickers} стикеров, ${stats.ultraAnimations} GIF.`
+      `Пул: ${stats.stickerSets} стикерпаков, ${stats.stickers} стикеров, ${stats.animations} GIF, тегов: ${stats.taggedRegular}.\nUltra-пул: ${stats.ultraStickerSets} стикерпаков, ${stats.ultraStickers} стикеров, ${stats.ultraAnimations} GIF, тегов: ${stats.taggedUltra}.`
     );
   }
 
@@ -335,6 +389,10 @@ function buildStatsTarget(target, targetMessage) {
 
 function getPoolLabel(pool) {
   return pool === 'ultra' ? 'ultra' : 'обычный';
+}
+
+function getHitContextText(message, targetMessage) {
+  return targetMessage.text || message.reply_to_message?.text || message.reply_to_message?.caption || message.text || message.caption || '';
 }
 
 function buildUltraChargeText(percent) {

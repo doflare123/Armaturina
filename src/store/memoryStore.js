@@ -23,7 +23,8 @@ class MemoryStore {
     const lastMessage = {
       messageId: message.message_id,
       userId: message.from.id,
-      username: message.from.username ? normalizeUsername(message.from.username) : null
+      username: message.from.username ? normalizeUsername(message.from.username) : null,
+      text: message.text || message.caption || ''
     };
 
     if (!this.lastMessagesByUserIdByChat.has(chatId)) {
@@ -72,7 +73,7 @@ class MemoryStore {
     return chatMessages.get(normalizeUsername(target.username)) || null;
   }
 
-  addStickerSet(setName, stickers, pool = 'regular') {
+  addStickerSet(setName, stickers, pool = 'regular', metadataByFileId = new Map()) {
     const targetStickerSets = pool === 'ultra' ? this.ultraStickerSets : this.stickerSets;
     const targetStickers = pool === 'ultra' ? this.ultraStickers : this.stickers;
 
@@ -84,7 +85,8 @@ class MemoryStore {
           type: 'sticker',
           fileId: sticker.file_id,
           setName,
-          pool
+          pool,
+          ...normalizeMediaMetadata(metadataByFileId.get(sticker.file_id))
         });
       }
     }
@@ -92,13 +94,14 @@ class MemoryStore {
     return stickers.length;
   }
 
-  addAnimation(fileId, pool = 'regular') {
+  addAnimation(fileId, pool = 'regular', metadata = {}) {
     const targetAnimations = pool === 'ultra' ? this.ultraAnimations : this.animations;
 
     targetAnimations.set(fileId, {
       type: 'animation',
       fileId,
-      pool
+      pool,
+      ...normalizeMediaMetadata(metadata)
     });
   }
 
@@ -115,6 +118,66 @@ class MemoryStore {
     }
 
     return media[Math.floor(Math.random() * media.length)];
+  }
+
+  getBestMediaByTags(pool = 'regular', wantedTags = []) {
+    const media = this.getMediaList(pool);
+    const wanted = normalizeTags(wantedTags);
+
+    if (media.length === 0 || wanted.length === 0) {
+      return null;
+    }
+
+    const scored = media
+      .map((item) => ({
+        item,
+        score: countTagMatches(item.tags, wanted)
+      }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score);
+
+    if (scored.length === 0) {
+      return null;
+    }
+
+    const bestScore = scored[0].score;
+    const best = scored.filter((entry) => entry.score === bestScore);
+
+    return best[Math.floor(Math.random() * best.length)].item;
+  }
+
+  getMediaList(pool = 'regular') {
+    const stickers = pool === 'ultra' ? this.ultraStickers : this.stickers;
+    const animations = pool === 'ultra' ? this.ultraAnimations : this.animations;
+
+    return [
+      ...stickers.values(),
+      ...animations.values()
+    ];
+  }
+
+  getUntaggedMedia(pool = 'regular', limit = 25) {
+    return this.getMediaList(pool)
+      .filter((item) => !item.tags || item.tags.length === 0)
+      .slice(0, limit);
+  }
+
+  updateMediaMetadata(fileId, pool = 'regular', metadata = {}) {
+    const media = this.findMedia(fileId, pool);
+
+    if (!media) {
+      return false;
+    }
+
+    Object.assign(media, normalizeMediaMetadata(metadata));
+    return true;
+  }
+
+  findMedia(fileId, pool = 'regular') {
+    const stickers = pool === 'ultra' ? this.ultraStickers : this.stickers;
+    const animations = pool === 'ultra' ? this.ultraAnimations : this.animations;
+
+    return stickers.get(fileId) || animations.get(fileId) || null;
   }
 
   hasMedia(pool = 'regular') {
@@ -190,7 +253,9 @@ class MemoryStore {
       animations: this.animations.size,
       ultraStickerSets: this.ultraStickerSets.size,
       ultraStickers: this.ultraStickers.size,
-      ultraAnimations: this.ultraAnimations.size
+      ultraAnimations: this.ultraAnimations.size,
+      taggedRegular: this.getMediaList('regular').filter((item) => item.tags && item.tags.length > 0).length,
+      taggedUltra: this.getMediaList('ultra').filter((item) => item.tags && item.tags.length > 0).length
     };
   }
 
@@ -220,7 +285,8 @@ class MemoryStore {
         this.stickers.set(sticker.fileId, {
           type: 'sticker',
           fileId: sticker.fileId,
-          setName: sticker.setName || null
+          setName: sticker.setName || null,
+          ...normalizeMediaMetadata(sticker)
         });
       }
     }
@@ -229,7 +295,8 @@ class MemoryStore {
       if (animation && animation.fileId) {
         this.animations.set(animation.fileId, {
           type: 'animation',
-          fileId: animation.fileId
+          fileId: animation.fileId,
+          ...normalizeMediaMetadata(animation)
         });
       }
     }
@@ -240,7 +307,8 @@ class MemoryStore {
           type: 'sticker',
           fileId: sticker.fileId,
           setName: sticker.setName || null,
-          pool: 'ultra'
+          pool: 'ultra',
+          ...normalizeMediaMetadata(sticker)
         });
       }
     }
@@ -250,7 +318,8 @@ class MemoryStore {
         this.ultraAnimations.set(animation.fileId, {
           type: 'animation',
           fileId: animation.fileId,
-          pool: 'ultra'
+          pool: 'ultra',
+          ...normalizeMediaMetadata(animation)
         });
       }
     }
@@ -274,6 +343,32 @@ class MemoryStore {
 
 function normalizeUsername(username) {
   return String(username).replace(/^@/, '').toLowerCase();
+}
+
+function normalizeMediaMetadata(metadata = {}) {
+  return {
+    tags: normalizeTags(metadata.tags),
+    mood: metadata.mood || null,
+    caption: metadata.caption || null,
+    analysisFileId: metadata.analysisFileId || null,
+    analysisMimeType: metadata.analysisMimeType || null,
+    taggedAt: metadata.taggedAt || null
+  };
+}
+
+function normalizeTags(tags = []) {
+  return [...new Set(
+    (Array.isArray(tags) ? tags : [])
+      .map((tag) => String(tag).trim().toLowerCase())
+      .filter(Boolean)
+      .slice(0, 12)
+  )];
+}
+
+function countTagMatches(actualTags = [], wantedTags = []) {
+  const actual = new Set(normalizeTags(actualTags));
+
+  return normalizeTags(wantedTags).filter((tag) => actual.has(tag)).length;
 }
 
 function getTargetKey(target) {

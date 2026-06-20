@@ -35,16 +35,26 @@ class FileStore extends MemoryStore {
     await fs.rename(temporaryPath, this.filePath);
   }
 
-  async addStickerSet(setName, stickers, pool = 'regular') {
-    const addedCount = super.addStickerSet(setName, stickers, pool);
+  async addStickerSet(setName, stickers, pool = 'regular', metadataByFileId = new Map()) {
+    const addedCount = super.addStickerSet(setName, stickers, pool, metadataByFileId);
     await this.save();
 
     return addedCount;
   }
 
-  async addAnimation(fileId, pool = 'regular') {
-    super.addAnimation(fileId, pool);
+  async addAnimation(fileId, pool = 'regular', metadata = {}) {
+    super.addAnimation(fileId, pool, metadata);
     await this.save();
+  }
+
+  async updateMediaMetadata(fileId, pool = 'regular', metadata = {}) {
+    const updated = super.updateMediaMetadata(fileId, pool, metadata);
+
+    if (updated) {
+      await this.save();
+    }
+
+    return updated;
   }
 
   async recordHit(chatId, target, isUltra = false) {
