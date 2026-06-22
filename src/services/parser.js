@@ -1,4 +1,4 @@
-const ARMATURINA_RE = /(?<![\p{L}\p{N}_])арматур[\p{L}\p{N}_]*(?![\p{L}\p{N}_])/iu;
+const ARMATURINA_RE = /^(?:[\s,.:;!?\-–—"'«»()]*)(арматур[\p{L}\p{N}_]*)(?![\p{L}\p{N}_])/iu;
 const USERNAME_RE = /@([a-zA-Z0-9_]{5,32})/;
 
 function getMessageText(message) {
@@ -6,7 +6,7 @@ function getMessageText(message) {
 }
 
 function hasArmaturina(text) {
-  return ARMATURINA_RE.test(text);
+  return getTriggerTail(text) !== null;
 }
 
 function parseAction(message) {
@@ -65,23 +65,31 @@ function parseAction(message) {
     };
   }
 
-  if (!hasArmaturina(text)) {
+  const triggerTail = getTriggerTail(text);
+
+  if (triggerTail === null) {
     return { type: 'none' };
   }
 
-  if (isAddGifText(lowerText)) {
-    return { type: 'add_gif', pool: getRequestedPool(lowerText) };
+  const lowerTriggerTail = triggerTail.toLowerCase();
+
+  if (!isAllowedTriggerTail(lowerTriggerTail)) {
+    return { type: 'none' };
   }
 
-  if (isAddStickerPackText(lowerText)) {
+  if (isAddGifText(lowerTriggerTail)) {
+    return { type: 'add_gif', pool: getRequestedPool(lowerTriggerTail) };
+  }
+
+  if (isAddStickerPackText(lowerTriggerTail)) {
     return {
       type: 'add_sticker_pack',
-      packName: extractStickerPackName(text),
-      pool: getRequestedPool(lowerText)
+      packName: extractStickerPackName(triggerTail),
+      pool: getRequestedPool(lowerTriggerTail)
     };
   }
 
-  const mentionTarget = extractMentionTarget(message, text);
+  const mentionTarget = extractMentionTarget(message, text, triggerTail);
 
   if (mentionTarget) {
     return {
@@ -102,14 +110,14 @@ function parseAction(message) {
   return { type: 'none' };
 }
 
-function extractMentionTarget(message, text) {
+function extractMentionTarget(message, text, searchText = text) {
   const entityTarget = extractMentionTargetFromEntities(message, text);
 
   if (entityTarget) {
     return entityTarget;
   }
 
-  const usernameMatch = text.match(USERNAME_RE);
+  const usernameMatch = searchText.match(USERNAME_RE);
 
   if (!usernameMatch) {
     return null;
@@ -167,6 +175,36 @@ function extractReplyTarget(message) {
     text: getMessageText(reply),
     label: reply.from.username ? `@${reply.from.username}` : reply.from.first_name
   };
+}
+
+function isAllowedTriggerTail(lowerTriggerTail) {
+  if (!lowerTriggerTail) {
+    return true;
+  }
+
+  if (isAddGifText(lowerTriggerTail) || isAddStickerPackText(lowerTriggerTail)) {
+    return true;
+  }
+
+  if (USERNAME_RE.test(lowerTriggerTail)) {
+    return true;
+  }
+
+  return isFasTail(lowerTriggerTail);
+}
+
+function isFasTail(lowerTriggerTail) {
+  return /^фас[.!?]*$/iu.test(lowerTriggerTail.trim());
+}
+
+function getTriggerTail(text) {
+  const match = text.match(ARMATURINA_RE);
+
+  if (!match) {
+    return null;
+  }
+
+  return text.slice(match[0].length).replace(/^[\s,.:;!?\-–—"'«»()]+/u, '').trim();
 }
 
 function isAddGifText(lowerText) {
