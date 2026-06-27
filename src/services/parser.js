@@ -29,6 +29,14 @@ function parseAction(message) {
     return { type: 'top' };
   }
 
+  if (lowerText.startsWith('/mute')) {
+    return parseMuteAction(message, text);
+  }
+
+  if (lowerText.startsWith('/ban')) {
+    return parseBanAction(message, text);
+  }
+
   if (lowerText.startsWith('/addultragif')) {
     return { type: 'add_gif', pool: 'ultra' };
   }
@@ -72,6 +80,18 @@ function parseAction(message) {
   }
 
   const lowerTriggerTail = triggerTail.toLowerCase();
+
+  const muteAction = parseMuteAction(message, triggerTail, text);
+
+  if (muteAction.type !== 'none') {
+    return muteAction;
+  }
+
+  const banAction = parseBanAction(message, triggerTail, text);
+
+  if (banAction.type !== 'none') {
+    return banAction;
+  }
 
   if (!isAllowedTriggerTail(lowerTriggerTail)) {
     return { type: 'none' };
@@ -186,6 +206,10 @@ function isAllowedTriggerTail(lowerTriggerTail) {
     return true;
   }
 
+  if (isMuteTail(lowerTriggerTail) || isBanTail(lowerTriggerTail)) {
+    return true;
+  }
+
   if (USERNAME_RE.test(lowerTriggerTail)) {
     return true;
   }
@@ -195,6 +219,71 @@ function isAllowedTriggerTail(lowerTriggerTail) {
 
 function isFasTail(lowerTriggerTail) {
   return /^фас[.!?]*$/iu.test(lowerTriggerTail.trim());
+}
+
+function isMuteTail(lowerTriggerTail) {
+  return /^завари\s+ебало(?=$|[^\p{L}\p{N}_])/iu.test(lowerTriggerTail.trim());
+}
+
+function isBanTail(lowerTriggerTail) {
+  return /^уеби(?=$|[^\p{L}\p{N}_])/iu.test(lowerTriggerTail.trim());
+}
+
+function parseMuteAction(message, commandText, fullText = commandText) {
+  const lowerCommandText = commandText.toLowerCase();
+  const isSlash = lowerCommandText.startsWith('/mute');
+  const isPhrase = isMuteTail(lowerCommandText);
+
+  if (!isSlash && !isPhrase) {
+    return { type: 'none' };
+  }
+
+  const minutes = extractMinutes(commandText);
+
+  if (!minutes) {
+    return { type: 'none' };
+  }
+
+  const target = extractMentionTarget(message, fullText, commandText) || extractReplyTarget(message);
+
+  return {
+    type: 'mute',
+    target,
+    minutes
+  };
+}
+
+function parseBanAction(message, commandText, fullText = commandText) {
+  const lowerCommandText = commandText.toLowerCase();
+  const isSlash = lowerCommandText.startsWith('/ban');
+  const isPhrase = isBanTail(lowerCommandText);
+
+  if (!isSlash && !isPhrase) {
+    return { type: 'none' };
+  }
+
+  const target = extractMentionTarget(message, fullText, commandText) || extractReplyTarget(message);
+
+  return {
+    type: 'ban',
+    target
+  };
+}
+
+function extractMinutes(text) {
+  const match = text.match(/\b(\d{1,5})\b/u);
+
+  if (!match) {
+    return null;
+  }
+
+  const minutes = Number(match[1]);
+
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return null;
+  }
+
+  return Math.min(minutes, 43_200);
 }
 
 function getTriggerTail(text) {

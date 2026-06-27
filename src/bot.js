@@ -12,6 +12,22 @@ import {
 const ULTRA_HIT_CHANCE = 0.01;
 const ULTRA_CHARGE_STEPS = [0, 20, 40, 60, 80, 100];
 const ULTRA_CHARGE_STEP_DELAY_MS = 650;
+const MUTE_PERMISSIONS = {
+  can_send_messages: false,
+  can_send_audios: false,
+  can_send_documents: false,
+  can_send_photos: false,
+  can_send_videos: false,
+  can_send_video_notes: false,
+  can_send_voice_notes: false,
+  can_send_polls: false,
+  can_send_other_messages: false,
+  can_add_web_page_previews: false,
+  can_change_info: false,
+  can_invite_users: false,
+  can_pin_messages: false,
+  can_manage_topics: false
+};
 
 function createBot(config) {
   const bot = new Bot(config.token);
@@ -115,6 +131,16 @@ function createBot(config) {
 
     if (action.type === 'retag') {
       await handleRetag(message, action.pool, action.limit);
+      return;
+    }
+
+    if (action.type === 'mute') {
+      await handleMute(message, action);
+      return;
+    }
+
+    if (action.type === 'ban') {
+      await handleBan(message, action);
       return;
     }
 
@@ -225,6 +251,85 @@ function createBot(config) {
     );
   }
 
+  function resolveModerationTarget(chatId, target) {
+    if (!target) {
+      return null;
+    }
+
+    if (target.userId) {
+      return {
+        userId: target.userId,
+        username: target.username || null,
+        label: target.label || (target.username ? `@${target.username}` : `id:${target.userId}`)
+      };
+    }
+
+    const targetMessage = store.getLastMessage(chatId, target);
+
+    return resolveModerationTargetFromLastMessage(target, targetMessage);
+  }
+
+  async function handleMute(message, action) {
+    const target = resolveModerationTarget(message.chat.id, action.target);
+
+    if (!target) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        'Не нашла кого мутить. Ответь командой на сообщение человека или используй @username того, кто уже писал в группе.'
+      );
+      return;
+    }
+
+    const untilDate = Math.floor(Date.now() / 1000) + action.minutes * 60;
+
+    try {
+      await bot.api.restrictChatMember(
+        message.chat.id,
+        target.userId,
+        MUTE_PERMISSIONS,
+        { until_date: untilDate }
+      );
+
+      await bot.api.sendMessage(
+        message.chat.id,
+        `Заварила ебало ${target.label} на ${action.minutes} мин.`
+      );
+    } catch (error) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        `Не смогла замутить ${target.label}: ${error.message}`
+      );
+    }
+  }
+
+  async function handleBan(message, action) {
+    const target = resolveModerationTarget(message.chat.id, action.target);
+
+    if (!target) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        'Не нашла кого банить. Ответь командой на сообщение человека или используй @username того, кто уже писал в группе.'
+      );
+      return;
+    }
+
+    try {
+      await bot.api.banChatMember(message.chat.id, target.userId, {
+        revoke_messages: true
+      });
+
+      await bot.api.sendMessage(
+        message.chat.id,
+        `Уебала ${target.label} из чата.`
+      );
+    } catch (error) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        `Не смогла забанить ${target.label}: ${error.message}`
+      );
+    }
+  }
+
   async function handleHit(message, target) {
     const targetMessage = target && target.messageId
       ? {
@@ -285,6 +390,10 @@ function createBot(config) {
       'Добавить ultra GIF: ответь на GIF командой /addultragif',
       'Статистика: /stats',
       'Топ недели: /top',
+      'Мут: ответь /mute 10 или напиши /mute @username 10',
+      'Мут фразой: Арматурина завари ебало на 10 минут',
+      'Бан с удалением сообщений: ответь /ban или напиши /ban @username',
+      'Бан фразой: Арматурина уеби его',
       'Пул: /pool'
     ].join('\n'));
   }
@@ -389,6 +498,20 @@ function buildStatsTarget(target, targetMessage) {
 
 function getPoolLabel(pool) {
   return pool === 'ultra' ? 'ultra' : 'обычный';
+}
+
+function resolveModerationTargetFromLastMessage(target, targetMessage) {
+  if (!targetMessage || !targetMessage.userId) {
+    return null;
+  }
+
+  const username = target.username || targetMessage.username || null;
+
+  return {
+    userId: targetMessage.userId,
+    username,
+    label: target.label || (username ? `@${username}` : `id:${targetMessage.userId}`)
+  };
 }
 
 function getHitContextText(message, targetMessage) {
