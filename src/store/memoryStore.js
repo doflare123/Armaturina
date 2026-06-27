@@ -8,6 +8,7 @@ class MemoryStore {
     this.ultraAnimations = new Map();
     this.ultraStickerSets = new Set();
     this.statsByChat = new Map();
+    this.lefStatsByChat = new Map();
 
     // Last messages are chat-scoped because replies must happen in the same group.
     this.lastMessagesByUsernameByChat = new Map();
@@ -246,6 +247,32 @@ class MemoryStore {
       .slice(0, limit);
   }
 
+  recordLef(chatId, target) {
+    const chatStats = this.getOrCreateLefStats(chatId);
+    const targetKey = getTargetKey(target);
+    const snake = chatStats.targets.get(targetKey) || {
+      userId: target.userId || null,
+      username: target.username || null,
+      label: target.label || target.username || String(target.userId || targetKey),
+      total: 0
+    };
+
+    snake.userId = target.userId || snake.userId;
+    snake.username = target.username || snake.username;
+    snake.label = target.label || snake.label;
+    snake.total += 1;
+    chatStats.total += 1;
+    chatStats.targets.set(targetKey, snake);
+  }
+
+  getLefTop(chatId, limit = 10) {
+    const chatStats = this.getOrCreateLefStats(chatId);
+
+    return [...chatStats.targets.values()]
+      .sort((left, right) => right.total - left.total)
+      .slice(0, limit);
+  }
+
   getStats() {
     return {
       stickerSets: this.stickerSets.size,
@@ -267,7 +294,8 @@ class MemoryStore {
       ultraStickerSets: [...this.ultraStickerSets.values()],
       ultraStickers: [...this.ultraStickers.values()],
       ultraAnimations: [...this.ultraAnimations.values()],
-      stats: exportStats(this.statsByChat)
+      stats: exportStats(this.statsByChat),
+      lefStats: exportLefStats(this.lefStatsByChat)
     };
   }
 
@@ -279,6 +307,7 @@ class MemoryStore {
     this.ultraStickers = new Map();
     this.ultraAnimations = new Map();
     this.statsByChat = importStats(mediaPool.stats || {});
+    this.lefStatsByChat = importLefStats(mediaPool.lefStats || {});
 
     for (const sticker of mediaPool.stickers || []) {
       if (sticker && sticker.fileId) {
@@ -338,6 +367,19 @@ class MemoryStore {
     }
 
     return this.statsByChat.get(key);
+  }
+
+  getOrCreateLefStats(chatId) {
+    const key = String(chatId);
+
+    if (!this.lefStatsByChat.has(key)) {
+      this.lefStatsByChat.set(key, {
+        total: 0,
+        targets: new Map()
+      });
+    }
+
+    return this.lefStatsByChat.get(key);
   }
 }
 
@@ -432,6 +474,43 @@ function importStats(stats) {
       ultraHits: chatStats.ultraHits || 0,
       weeklyHits: chatStats.weeklyHits || {},
       victims
+    });
+  }
+
+  return statsByChat;
+}
+
+function exportLefStats(lefStatsByChat) {
+  const result = {};
+
+  for (const [chatId, chatStats] of lefStatsByChat.entries()) {
+    result[chatId] = {
+      total: chatStats.total,
+      targets: Object.fromEntries(chatStats.targets.entries())
+    };
+  }
+
+  return result;
+}
+
+function importLefStats(stats) {
+  const statsByChat = new Map();
+
+  for (const [chatId, chatStats] of Object.entries(stats)) {
+    const targets = new Map();
+
+    for (const [targetKey, target] of Object.entries(chatStats.targets || {})) {
+      targets.set(targetKey, {
+        userId: target.userId || null,
+        username: target.username || null,
+        label: target.label || target.username || targetKey,
+        total: target.total || 0
+      });
+    }
+
+    statsByChat.set(chatId, {
+      total: chatStats.total || 0,
+      targets
     });
   }
 

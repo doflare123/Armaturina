@@ -29,6 +29,10 @@ function parseAction(message) {
     return { type: 'top' };
   }
 
+  if (lowerText.startsWith('/lef_top') || lowerText.startsWith('/snake_top')) {
+    return { type: 'lef_top' };
+  }
+
   if (lowerText.startsWith('/mute')) {
     return parseMuteAction(message, text);
   }
@@ -91,6 +95,16 @@ function parseAction(message) {
 
   if (banAction.type !== 'none') {
     return banAction;
+  }
+
+  const lefAction = parseLefAction(message, triggerTail, text);
+
+  if (lefAction.type !== 'none') {
+    return lefAction;
+  }
+
+  if (startsWithLefVerb(lowerTriggerTail)) {
+    return { type: 'none' };
   }
 
   if (!isAllowedTriggerTail(lowerTriggerTail)) {
@@ -210,6 +224,10 @@ function isAllowedTriggerTail(lowerTriggerTail) {
     return true;
   }
 
+  if (isLefTail(lowerTriggerTail)) {
+    return true;
+  }
+
   if (USERNAME_RE.test(lowerTriggerTail)) {
     return true;
   }
@@ -227,6 +245,14 @@ function isMuteTail(lowerTriggerTail) {
 
 function isBanTail(lowerTriggerTail) {
   return /^уеби(?=$|[^\p{L}\p{N}_])/iu.test(lowerTriggerTail.trim());
+}
+
+function isLefTail(lowerTriggerTail) {
+  return /^(оформи|сделай)\s+(горловой|слюнявый|минет)(?=$|[^\p{L}\p{N}_])/iu.test(lowerTriggerTail.trim());
+}
+
+function startsWithLefVerb(lowerTriggerTail) {
+  return /^(оформи|сделай)(?=$|[^\p{L}\p{N}_])/iu.test(lowerTriggerTail.trim());
 }
 
 function parseMuteAction(message, commandText, fullText = commandText) {
@@ -267,6 +293,36 @@ function parseBanAction(message, commandText, fullText = commandText) {
   return {
     type: 'ban',
     target
+  };
+}
+
+function parseLefAction(message, commandText, fullText = commandText) {
+  const lowerCommandText = commandText.toLowerCase();
+
+  if (!isLefTail(lowerCommandText)) {
+    return { type: 'none' };
+  }
+
+  const target = extractMentionTarget(message, fullText, commandText) || buildSelfTarget(message);
+  const variantMatch = lowerCommandText.match(/^(?:оформи|сделай)\s+(горловой|слюнявый|минет)/iu);
+
+  return {
+    type: 'lef',
+    target,
+    variant: variantMatch ? variantMatch[1] : 'горловой'
+  };
+}
+
+function buildSelfTarget(message) {
+  if (!message.from) {
+    return null;
+  }
+
+  return {
+    type: 'self',
+    userId: message.from.id,
+    username: message.from.username || null,
+    label: message.from.username ? `@${message.from.username}` : message.from.first_name
   };
 }
 

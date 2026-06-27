@@ -1,4 +1,6 @@
-import { Bot } from 'grammy';
+import { Bot, InputFile } from 'grammy';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { FileStore } from './store/fileStore.js';
 import { AdminChecker, isGroupChat } from './services/admin.js';
 import { GeminiService } from './services/gemini.js';
@@ -12,6 +14,20 @@ import {
 const ULTRA_HIT_CHANCE = 0.01;
 const ULTRA_CHARGE_STEPS = [0, 20, 40, 60, 80, 100];
 const ULTRA_CHARGE_STEP_DELAY_MS = 650;
+const LEF_IMAGE_CHANCE = 0.1;
+const LEF_ANIMATION_DELAY_MS = 1_000;
+const LEF_ANIMATION_FRAMES = [
+  'Подготовка комиссии...',
+  'Проверяю давление в системе...',
+  'Смазываю бюрократию...',
+  'Причмокиваю протокол...',
+  'Запускаю слюнявый контур...',
+  'Калибрую горловой модуль...',
+  'Шлепаю печать качества...',
+  'Финальный причмок...',
+  'Закрываю наряд-допуск...',
+  'Оформлено.'
+];
 const MUTE_PERMISSIONS = {
   can_send_messages: false,
   can_send_audios: false,
@@ -152,7 +168,7 @@ function createBot(config) {
   }
 
   function isPublicAction(action) {
-    return action.type === 'stats' || action.type === 'top';
+    return action.type === 'stats' || action.type === 'top' || action.type === 'lef_top' || action.type === 'lef';
   }
 
   async function handlePublicAction(message, action) {
@@ -163,6 +179,16 @@ function createBot(config) {
 
     if (action.type === 'top') {
       await sendTop(message.chat.id);
+      return;
+    }
+
+    if (action.type === 'lef_top') {
+      await sendLefTop(message.chat.id);
+      return;
+    }
+
+    if (action.type === 'lef') {
+      await handleLef(message, action);
     }
   }
 
@@ -364,6 +390,60 @@ function createBot(config) {
     }
   }
 
+  async function handleLef(message, action) {
+    const target = resolveLefTarget(message.chat.id, action.target);
+
+    if (!target) {
+      await bot.api.sendMessage(message.chat.id, 'Не нашла кому оформлять. Используй @username того, кто уже писал в группе.');
+      return;
+    }
+
+    if (Math.random() < LEF_IMAGE_CHANCE) {
+      const imagePath = await getRandomLefImage(config.lefAssetsPath);
+
+      if (imagePath) {
+        await bot.api.sendPhoto(message.chat.id, new InputFile(imagePath), {
+          caption: `Оформлено для ${target.label}.`
+        });
+        await store.recordLef(message.chat.id, target);
+        return;
+      }
+    }
+
+    await playLefAnimation(message.chat.id, target, action.variant);
+    await store.recordLef(message.chat.id, target);
+  }
+
+  function resolveLefTarget(chatId, target) {
+    if (!target) {
+      return null;
+    }
+
+    if (target.userId) {
+      return {
+        userId: target.userId,
+        username: target.username || null,
+        label: target.label || (target.username ? `@${target.username}` : `id:${target.userId}`)
+      };
+    }
+
+    const targetMessage = store.getLastMessage(chatId, target);
+
+    if (!targetMessage) {
+      return {
+        userId: null,
+        username: target.username || null,
+        label: target.label || (target.username ? `@${target.username}` : 'цель')
+      };
+    }
+
+    return {
+      userId: targetMessage.userId,
+      username: target.username || targetMessage.username || null,
+      label: target.label || (target.username ? `@${target.username}` : `id:${targetMessage.userId}`)
+    };
+  }
+
   async function canBotModerate(chatId) {
     if (!botInfo) {
       botInfo = await bot.api.getMe();
@@ -447,6 +527,8 @@ function createBot(config) {
       'Мут фразой: Арматурина завари ебало на 10 минут',
       'Бан с удалением сообщений: ответь /ban или напиши /ban @username',
       'Бан фразой: Арматурина уеби его',
+      'Оформить: Арматурина оформи горловой / слюнявый / минет',
+      'Змеиный топ: /lef_top',
       'Пул: /pool'
     ].join('\n'));
   }
@@ -494,6 +576,43 @@ function createBot(config) {
       'Топ недели: Почетная хрептина недели',
       ...lines
     ].join('\n'));
+  }
+
+  async function sendLefTop(chatId) {
+    const top = store.getLefTop(chatId, 10);
+
+    if (top.length === 0) {
+      await bot.api.sendMessage(chatId, 'Змеиный топ пока пуст.');
+      return;
+    }
+
+    const lines = top.map((target, index) => {
+      const title = index === 0 ? ' - король змей' : '';
+
+      return `${index + 1}. ${target.label} - ${target.total}${title}`;
+    });
+
+    await bot.api.sendMessage(chatId, [
+      'Змеиный топ:',
+      ...lines
+    ].join('\n'));
+  }
+
+  async function playLefAnimation(chatId, target, variant) {
+    const message = await bot.api.sendMessage(
+      chatId,
+      buildLefFrameText(target, variant, LEF_ANIMATION_FRAMES[0], 1)
+    );
+
+    for (let index = 1; index < LEF_ANIMATION_FRAMES.length; index += 1) {
+      await delay(LEF_ANIMATION_DELAY_MS);
+
+      await bot.api.editMessageText(
+        chatId,
+        message.message_id,
+        buildLefFrameText(target, variant, LEF_ANIMATION_FRAMES[index], index + 1)
+      );
+    }
   }
 
   async function playUltraCharge(chatId, options) {
@@ -581,6 +700,69 @@ function buildUltraChargeText(percent) {
   }
 
   return `${bar} ${percent}%\nЗарядка мега-хрептины`;
+}
+
+function buildLefFrameText(target, variant, frame, index) {
+  const progress = `${index}/${LEF_ANIMATION_FRAMES.length}`;
+
+  return [
+    `${frame}`,
+    '',
+    `Цель: ${target.label}`,
+    `Тип: ${variant}`,
+    `Прогресс: ${progress}`
+  ].join('\n');
+}
+
+async function getRandomLefImage(lefAssetsPath) {
+  const imagePaths = await getLefImagePaths(lefAssetsPath);
+
+  if (imagePaths.length === 0) {
+    return null;
+  }
+
+  return imagePaths[Math.floor(Math.random() * imagePaths.length)];
+}
+
+async function getLefImagePaths(lefAssetsPath) {
+  const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
+  const paths = [];
+
+  try {
+    const stat = await fs.stat(lefAssetsPath);
+
+    if (stat.isFile() && imageExtensions.has(path.extname(lefAssetsPath).toLowerCase())) {
+      return [lefAssetsPath];
+    }
+
+    if (stat.isDirectory()) {
+      const entries = await fs.readdir(lefAssetsPath, { withFileTypes: true });
+
+      for (const entry of entries) {
+        const filePath = path.join(lefAssetsPath, entry.name);
+
+        if (entry.isFile() && imageExtensions.has(path.extname(entry.name).toLowerCase())) {
+          paths.push(filePath);
+        }
+      }
+    }
+  } catch {
+    // Missing folder is fine; fall back to data/lef.jpg below.
+  }
+
+  const fallbackPath = path.join(path.dirname(lefAssetsPath), 'lef.jpg');
+
+  try {
+    const fallbackStat = await fs.stat(fallbackPath);
+
+    if (fallbackStat.isFile()) {
+      paths.push(fallbackPath);
+    }
+  } catch {
+    // No fallback image configured.
+  }
+
+  return paths;
 }
 
 function delay(ms) {

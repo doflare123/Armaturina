@@ -61,6 +61,11 @@ class FileStore extends MemoryStore {
     super.recordHit(chatId, target, isUltra);
     await this.save();
   }
+
+  async recordLef(chatId, target) {
+    super.recordLef(chatId, target);
+    await this.save();
+  }
 }
 
 export {

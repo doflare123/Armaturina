@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const defaultDataFilePath = path.resolve(currentDir, '..', 'data', 'media-pool.json');
+const defaultLefAssetsPath = path.resolve(currentDir, '..', 'data', 'lef');
 
 function loadConfig(options = {}) {
   const token = options.token || process.env.ARMATURINA_BOT_TOKEN || process.env.BOT_TOKEN;
@@ -11,6 +12,9 @@ function loadConfig(options = {}) {
     process.env.ARMATURINA_DATA_FILE ||
     process.env.DATA_FILE ||
     defaultDataFilePath;
+  const lefAssetsPath = options.lefAssetsPath ||
+    process.env.ARMATURINA_LEF_ASSETS ||
+    defaultLefAssetsPath;
   const geminiMaxTagsPerPack = Number(
     options.geminiMaxTagsPerPack ||
     process.env.ARMATURINA_GEMINI_MAX_TAGS_PER_PACK ||
@@ -26,6 +30,9 @@ function loadConfig(options = {}) {
     dataFilePath: path.isAbsolute(dataFilePath)
       ? dataFilePath
       : path.resolve(process.cwd(), dataFilePath),
+    lefAssetsPath: path.isAbsolute(lefAssetsPath)
+      ? lefAssetsPath
+      : path.resolve(process.cwd(), lefAssetsPath),
     gemini: {
       apiKey: options.geminiApiKey || process.env.ARMATURINA_GEMINI_API_KEY || process.env.GEMINI_API_KEY || null,
       baseUrl: options.geminiBaseUrl || process.env.ARMATURINA_GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
