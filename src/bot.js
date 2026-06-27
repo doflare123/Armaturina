@@ -37,6 +37,7 @@ function createBot(config) {
     ...config.gemini,
     telegramToken: config.token
   });
+  let botInfo = null;
   let started = false;
   let pollingPromise = null;
 
@@ -46,6 +47,7 @@ function createBot(config) {
     }
 
     await store.load();
+    botInfo = await bot.api.getMe();
 
     bot.on('message', async (ctx) => {
       await handleMessage(ctx.message);
@@ -280,6 +282,14 @@ function createBot(config) {
       return;
     }
 
+    if (!await canBotModerate(message.chat.id)) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        'Не могу мутить: сделай бота админом и включи ему право банить/ограничивать участников.'
+      );
+      return;
+    }
+
     const untilDate = Math.floor(Date.now() / 1000) + action.minutes * 60;
 
     try {
@@ -295,6 +305,14 @@ function createBot(config) {
         `Заварила ебало ${target.label} на ${action.minutes} мин.`
       );
     } catch (error) {
+      if (isChatAdminRequiredError(error)) {
+        await bot.api.sendMessage(
+          message.chat.id,
+          'Telegram не дал замутить: у бота нет админского права банить/ограничивать участников.'
+        );
+        return;
+      }
+
       await bot.api.sendMessage(
         message.chat.id,
         `Не смогла замутить ${target.label}: ${error.message}`
@@ -313,6 +331,14 @@ function createBot(config) {
       return;
     }
 
+    if (!await canBotModerate(message.chat.id)) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        'Не могу банить: сделай бота админом и включи ему право банить/ограничивать участников.'
+      );
+      return;
+    }
+
     try {
       await bot.api.banChatMember(message.chat.id, target.userId, {
         revoke_messages: true
@@ -323,10 +349,37 @@ function createBot(config) {
         `Уебала ${target.label} из чата.`
       );
     } catch (error) {
+      if (isChatAdminRequiredError(error)) {
+        await bot.api.sendMessage(
+          message.chat.id,
+          'Telegram не дал забанить: у бота нет админского права банить/ограничивать участников.'
+        );
+        return;
+      }
+
       await bot.api.sendMessage(
         message.chat.id,
         `Не смогла забанить ${target.label}: ${error.message}`
       );
+    }
+  }
+
+  async function canBotModerate(chatId) {
+    if (!botInfo) {
+      botInfo = await bot.api.getMe();
+    }
+
+    try {
+      const member = await bot.api.getChatMember(chatId, botInfo.id);
+
+      if (member.status === 'creator') {
+        return true;
+      }
+
+      return member.status === 'administrator' && Boolean(member.can_restrict_members);
+    } catch (error) {
+      console.error('Failed to check bot moderation permissions:', error);
+      return false;
     }
   }
 
@@ -534,6 +587,15 @@ function delay(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function isChatAdminRequiredError(error) {
+  return error && (
+    error.error_code === 400 ||
+    error.errorCode === 400 ||
+    error.description ||
+    error.message
+  ) && String(error.description || error.message || '').includes('CHAT_ADMIN_REQUIRED');
 }
 
 export {
