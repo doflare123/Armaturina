@@ -376,6 +376,10 @@ function createBot(config) {
       return;
     }
 
+    if (!await canModerateTarget(message.chat.id, target, 'замутить')) {
+      return;
+    }
+
     const untilDate = Math.floor(Date.now() / 1000) + action.minutes * 60;
 
     try {
@@ -388,9 +392,14 @@ function createBot(config) {
 
       await bot.api.sendMessage(
         message.chat.id,
-        `Заварила ебало ${target.label} на ${action.minutes} мин.`
+        `Заварила ебало ${target.label} на ${formatDuration(action.minutes)}.`
       );
     } catch (error) {
+      if (isTargetAdminError(error)) {
+        await sendTargetAdminError(message.chat.id, target, 'замутить');
+        return;
+      }
+
       if (isChatAdminRequiredError(error)) {
         await bot.api.sendMessage(
           message.chat.id,
@@ -425,6 +434,10 @@ function createBot(config) {
       return;
     }
 
+    if (!await canModerateTarget(message.chat.id, target, 'забанить')) {
+      return;
+    }
+
     try {
       await bot.api.banChatMember(message.chat.id, target.userId, {
         revoke_messages: true
@@ -435,6 +448,11 @@ function createBot(config) {
         `Уебала ${target.label} из чата.`
       );
     } catch (error) {
+      if (isTargetAdminError(error)) {
+        await sendTargetAdminError(message.chat.id, target, 'забанить');
+        return;
+      }
+
       if (isChatAdminRequiredError(error)) {
         await bot.api.sendMessage(
           message.chat.id,
@@ -571,6 +589,29 @@ function createBot(config) {
     }
   }
 
+  async function canModerateTarget(chatId, target, actionName) {
+    try {
+      const member = await bot.api.getChatMember(chatId, target.userId);
+
+      if (member.status === 'creator' || member.status === 'administrator') {
+        await sendTargetAdminError(chatId, target, actionName);
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Failed to check moderation target:', error);
+      return true;
+    }
+  }
+
+  async function sendTargetAdminError(chatId, target, actionName) {
+    await bot.api.sendMessage(
+      chatId,
+      `Не могу ${actionName} ${target.label}: Telegram не дает боту трогать админов и владельца чата. Сначала сними с него админку, потом зовите Арматурину с арматурой.`
+    );
+  }
+
   async function handleHit(message, target) {
     const targetMessage = target && target.messageId
       ? {
@@ -631,8 +672,8 @@ function createBot(config) {
       'Добавить ultra GIF: ответь на GIF командой /addultragif',
       'Статистика: /stats',
       'Топ недели: /top',
-      'Мут: ответь /mute 10 или напиши /mute @username 10',
-      'Мут фразой: Арматурина завари ебало на 10 минут',
+      'Мут: ответь /mute 10, /mute 2ч, /mute 1д или напиши /mute @username 2 часа',
+      'Мут фразой: Арматурина завари ебало на 10 минут / 2 часа / 1 день',
       'Бан с удалением сообщений: ответь /ban или напиши /ban @username',
       'Бан фразой: Арматурина уеби его',
       'Оформить: Арматурина оформи горловой / слюнявый / минет',
@@ -849,6 +890,42 @@ function getUnauthorizedMuteMinutes(attemptCount) {
   ];
 }
 
+function formatDuration(minutes) {
+  if (minutes % 1_440 === 0) {
+    const days = minutes / 1_440;
+
+    return `${days} ${pluralizeRu(days, ['день', 'дня', 'дней'])}`;
+  }
+
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+
+    return `${hours} ${pluralizeRu(hours, ['час', 'часа', 'часов'])}`;
+  }
+
+  return `${minutes} ${pluralizeRu(minutes, ['минуту', 'минуты', 'минут'])}`;
+}
+
+function pluralizeRu(value, forms) {
+  const absValue = Math.abs(value);
+  const lastTwo = absValue % 100;
+  const last = absValue % 10;
+
+  if (lastTwo >= 11 && lastTwo <= 14) {
+    return forms[2];
+  }
+
+  if (last === 1) {
+    return forms[0];
+  }
+
+  if (last >= 2 && last <= 4) {
+    return forms[1];
+  }
+
+  return forms[2];
+}
+
 async function getRandomLefImage(lefAssetsPath) {
   const imagePaths = await getLefImagePaths(lefAssetsPath);
 
@@ -913,6 +990,21 @@ function isChatAdminRequiredError(error) {
     error.description ||
     error.message
   ) && String(error.description || error.message || '').includes('CHAT_ADMIN_REQUIRED');
+}
+
+function isTargetAdminError(error) {
+  const text = getTelegramErrorText(error).toLowerCase();
+
+  return text.includes('user is an administrator of the chat') ||
+    text.includes('user_admin_invalid') ||
+    text.includes('not enough rights to restrict') ||
+    text.includes('not enough rights to ban') ||
+    text.includes("can't restrict") ||
+    text.includes("can't ban");
+}
+
+function getTelegramErrorText(error) {
+  return String(error?.description || error?.message || '');
 }
 
 export {

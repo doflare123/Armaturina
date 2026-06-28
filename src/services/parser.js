@@ -264,7 +264,7 @@ function parseMuteAction(message, commandText, fullText = commandText) {
     return { type: 'none' };
   }
 
-  const minutes = extractMinutes(commandText);
+  const minutes = extractDurationMinutes(commandText);
 
   const target = extractMentionTarget(message, fullText, commandText) || extractReplyTarget(message);
 
@@ -322,20 +322,36 @@ function buildSelfTarget(message) {
   };
 }
 
-function extractMinutes(text) {
-  const match = text.match(/\b(\d{1,5})\b/u);
+function extractDurationMinutes(text) {
+  const match = text.match(/(^|[^\p{L}\p{N}_])(\d{1,5})\s*(мин(?:\.|ут[а-я]*)?|м(?:\.|ин)?|ч(?:\.|ас(?:а|ов)?)?|час(?:а|ов)?|д(?:\.|н(?:я|ей|ень)?)?|день|дня|дней)?(?=$|[^\p{L}\p{N}_])/iu);
 
   if (!match) {
     return null;
   }
 
-  const minutes = Number(match[1]);
+  const value = Number(match[2]);
 
-  if (!Number.isFinite(minutes) || minutes <= 0) {
+  if (!Number.isFinite(value) || value <= 0) {
     return null;
   }
 
+  const unit = (match[3] || 'мин').toLowerCase().replace(/\.$/u, '');
+  const multiplier = getDurationUnitMultiplier(unit);
+  const minutes = value * multiplier;
+
   return Math.min(minutes, 43_200);
+}
+
+function getDurationUnitMultiplier(unit) {
+  if (unit.startsWith('ч') || unit.startsWith('час')) {
+    return 60;
+  }
+
+  if (unit.startsWith('д')) {
+    return 1_440;
+  }
+
+  return 1;
 }
 
 function getTriggerTail(text) {
