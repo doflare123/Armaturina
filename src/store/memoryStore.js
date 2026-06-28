@@ -9,6 +9,7 @@ class MemoryStore {
     this.ultraStickerSets = new Set();
     this.statsByChat = new Map();
     this.lefStatsByChat = new Map();
+    this.moderationAbuseByChat = new Map();
 
     // Last messages are chat-scoped because replies must happen in the same group.
     this.lastMessagesByUsernameByChat = new Map();
@@ -273,6 +274,31 @@ class MemoryStore {
       .slice(0, limit);
   }
 
+  recordModerationAbuse(chatId, user, now = Date.now()) {
+    const chatAbuse = this.getOrCreateModerationAbuse(chatId);
+    const userKey = getUserKey(user);
+    const current = chatAbuse.get(userKey);
+    const expired = !current || now - current.lastAt > 30 * 60 * 1000;
+    const entry = expired
+      ? {
+          userId: user.id || null,
+          username: user.username || null,
+          label: getUserLabel(user),
+          count: 0,
+          lastAt: 0
+        }
+      : current;
+
+    entry.userId = user.id || entry.userId;
+    entry.username = user.username || entry.username;
+    entry.label = getUserLabel(user) || entry.label;
+    entry.count += 1;
+    entry.lastAt = now;
+    chatAbuse.set(userKey, entry);
+
+    return { ...entry };
+  }
+
   getStats() {
     return {
       stickerSets: this.stickerSets.size,
@@ -295,7 +321,8 @@ class MemoryStore {
       ultraStickers: [...this.ultraStickers.values()],
       ultraAnimations: [...this.ultraAnimations.values()],
       stats: exportStats(this.statsByChat),
-      lefStats: exportLefStats(this.lefStatsByChat)
+      lefStats: exportLefStats(this.lefStatsByChat),
+      moderationAbuse: exportModerationAbuse(this.moderationAbuseByChat)
     };
   }
 
@@ -308,6 +335,7 @@ class MemoryStore {
     this.ultraAnimations = new Map();
     this.statsByChat = importStats(mediaPool.stats || {});
     this.lefStatsByChat = importLefStats(mediaPool.lefStats || {});
+    this.moderationAbuseByChat = importModerationAbuse(mediaPool.moderationAbuse || {});
 
     for (const sticker of mediaPool.stickers || []) {
       if (sticker && sticker.fileId) {
@@ -381,10 +409,40 @@ class MemoryStore {
 
     return this.lefStatsByChat.get(key);
   }
+
+  getOrCreateModerationAbuse(chatId) {
+    const key = String(chatId);
+
+    if (!this.moderationAbuseByChat.has(key)) {
+      this.moderationAbuseByChat.set(key, new Map());
+    }
+
+    return this.moderationAbuseByChat.get(key);
+  }
 }
 
 function normalizeUsername(username) {
   return String(username).replace(/^@/, '').toLowerCase();
+}
+
+function getUserKey(user) {
+  if (user.id) {
+    return `id:${user.id}`;
+  }
+
+  if (user.username) {
+    return `username:${normalizeUsername(user.username)}`;
+  }
+
+  return `label:${getUserLabel(user)}`;
+}
+
+function getUserLabel(user) {
+  if (user.username) {
+    return `@${user.username}`;
+  }
+
+  return user.first_name || user.last_name || String(user.id || 'user');
 }
 
 function normalizeMediaMetadata(metadata = {}) {
@@ -515,6 +573,38 @@ function importLefStats(stats) {
   }
 
   return statsByChat;
+}
+
+function exportModerationAbuse(moderationAbuseByChat) {
+  const result = {};
+
+  for (const [chatId, chatAbuse] of moderationAbuseByChat.entries()) {
+    result[chatId] = Object.fromEntries(chatAbuse.entries());
+  }
+
+  return result;
+}
+
+function importModerationAbuse(stats) {
+  const moderationAbuseByChat = new Map();
+
+  for (const [chatId, chatStats] of Object.entries(stats)) {
+    const chatAbuse = new Map();
+
+    for (const [userKey, entry] of Object.entries(chatStats || {})) {
+      chatAbuse.set(userKey, {
+        userId: entry.userId || null,
+        username: entry.username || null,
+        label: entry.label || entry.username || userKey,
+        count: entry.count || 0,
+        lastAt: entry.lastAt || 0
+      });
+    }
+
+    moderationAbuseByChat.set(chatId, chatAbuse);
+  }
+
+  return moderationAbuseByChat;
 }
 
 export {

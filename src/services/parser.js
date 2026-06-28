@@ -1,4 +1,4 @@
-const ARMATURINA_RE = /^(?:[\s,.:;!?\-–—"'«»()]*)(арматур[\p{L}\p{N}_]*)(?![\p{L}\p{N}_])/iu;
+const ARMATURINA_RE = /^(?:[\s,.:;!?\-–—"'«»()]*)(?:арматур[\p{L}\p{N}_]*|арматр[\p{L}\p{N}_]*)(?![\p{L}\p{N}_])/iu;
 const USERNAME_RE = /@([a-zA-Z0-9_]{5,32})/;
 
 function getMessageText(message) {
@@ -265,10 +265,6 @@ function parseMuteAction(message, commandText, fullText = commandText) {
   }
 
   const minutes = extractMinutes(commandText);
-
-  if (!minutes) {
-    return { type: 'none' };
-  }
 
   const target = extractMentionTarget(message, fullText, commandText) || extractReplyTarget(message);
 

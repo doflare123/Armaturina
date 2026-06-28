@@ -66,6 +66,13 @@ class FileStore extends MemoryStore {
     super.recordLef(chatId, target);
     await this.save();
   }
+
+  async recordModerationAbuse(chatId, user, now = Date.now()) {
+    const result = super.recordModerationAbuse(chatId, user, now);
+    await this.save();
+
+    return result;
+  }
 }
 
 export {

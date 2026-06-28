@@ -16,6 +16,7 @@ const ULTRA_CHARGE_STEPS = [0, 20, 40, 60, 80, 100];
 const ULTRA_CHARGE_STEP_DELAY_MS = 650;
 const LEF_IMAGE_CHANCE = 0.1;
 const LEF_ANIMATION_DELAY_MS = 1_000;
+const NON_ADMIN_MUTE_ESCALATION_MINUTES = [3, 5, 10, 15, 30];
 const LEF_ANIMATION_FRAMES = [
   'Подготовка комиссии...',
   'Проверяю давление в системе...',
@@ -44,6 +45,40 @@ const MUTE_PERMISSIONS = {
   can_pin_messages: false,
   can_manage_topics: false
 };
+const NON_ADMIN_BAN_REPLIES = [
+  'Уебалка еще не выросла. Сиди ровно, гроза песочницы.',
+  'Ты херли хулиганишь? Мне твоей маме позвонить или сам угомонишься?',
+  'Командовать банами будешь, когда штаны до админки дорастут.',
+  'Не дорос ты до кнопки "уеби". Максимум можешь уебать себя в настройки.',
+  'У тебя прав на бан меньше, чем терпения у Арматурины утром.',
+  'Положи банхаммер обратно, богатырь картонный.'
+];
+const NON_ADMIN_HIT_REPLIES = [
+  'Фаскать будешь, когда админка прорежется. А пока сиди на лавочке запасных.',
+  'Арматурина посмотрела на твои права и нашла там дырку от бублика.',
+  'Ты сейчас так уверенно командуешь, будто у тебя не пластиковый бейджик из детского меню.',
+  'Не могу пиздануть по твоей заявке: уровень допуска "мам, можно?".',
+  'Команда принята, уважение не найдено, админка отсутствует.',
+  'Хрептинатор доступен только старшим по подъезду. Ты пока младший по коврику.',
+  'Ты кого натравить собрался, кнопочный самурай без кнопок?',
+  'Арматурина без админского жетона не кусает. Максимум презрительно хрюкает.',
+  'Запрос отклонен: у заявителя прав меньше, чем сдачи в маршрутке.',
+  'Сначала стань админом, потом размахивай арматурой, терминатор с авито.'
+];
+const NON_ADMIN_MUTE_WARNINGS = [
+  'Я щас тебе заварю ебальник, если ты не прекратишь.',
+  'Еще раз дернешь мут без админки - будешь молчать и думать о вечном.',
+  'Не трогай мут, пока лапки админские не выросли.',
+  'Смотри аккуратнее, а то сейчас ебальник на техобслуживание уйдет.',
+  'Хулиганский пульт от мута у тебя бутафорский. Не нажимай.'
+];
+const NON_ADMIN_MUTE_PUNISHMENTS = [
+  'Подумай о своем поведении, в следующий раз позвоню твоей маме.',
+  'Заварила. Сиди тихо и перечитывай инструкцию "как не быть дерзким".',
+  'Ебальник закрыт на профилактику. Дыши носом, герой.',
+  'Мут оформлен. Не благодари, это воспитательная медицина.',
+  'Отправляю тебя в режим радиомолчания. Возвращайся с нормальным лицом.'
+];
 
 function createBot(config) {
   const bot = new Bot(config.token);
@@ -124,6 +159,7 @@ function createBot(config) {
     const admin = await canUseAdminAction(message);
 
     if (!admin) {
+      await handleUnauthorizedAdminAction(message, action);
       return;
     }
 
@@ -164,6 +200,22 @@ function createBot(config) {
 
     if (action.type === 'hit') {
       await handleHit(message, action.target);
+    }
+  }
+
+  async function handleUnauthorizedAdminAction(message, action) {
+    if (action.type === 'hit') {
+      await sendRandomReply(bot.api, message, NON_ADMIN_HIT_REPLIES);
+      return;
+    }
+
+    if (action.type === 'ban') {
+      await sendRandomReply(bot.api, message, NON_ADMIN_BAN_REPLIES);
+      return;
+    }
+
+    if (action.type === 'mute') {
+      await handleUnauthorizedMute(message);
     }
   }
 
@@ -298,6 +350,14 @@ function createBot(config) {
   }
 
   async function handleMute(message, action) {
+    if (!action.minutes) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        'Сколько минут заваривать-то? Напиши /mute 10 ответом или /mute @username 10.'
+      );
+      return;
+    }
+
     const target = resolveModerationTarget(message.chat.id, action.target);
 
     if (!target) {
@@ -386,6 +446,54 @@ function createBot(config) {
       await bot.api.sendMessage(
         message.chat.id,
         `Не смогла забанить ${target.label}: ${error.message}`
+      );
+    }
+  }
+
+  async function handleUnauthorizedMute(message) {
+    if (!message.from) {
+      await sendRandomReply(bot.api, message, NON_ADMIN_MUTE_WARNINGS);
+      return;
+    }
+
+    const attempt = await store.recordModerationAbuse(message.chat.id, message.from);
+
+    if (attempt.count === 1) {
+      await sendRandomReply(bot.api, message, NON_ADMIN_MUTE_WARNINGS);
+      return;
+    }
+
+    const minutes = getUnauthorizedMuteMinutes(attempt.count);
+
+    if (!await canBotModerate(message.chat.id)) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        'Я бы тебе уже заварила ебальник, но мне не дали право ограничивать участников. Считай, что сегодня пронесло.',
+        buildReplyOptions(message)
+      );
+      return;
+    }
+
+    const untilDate = Math.floor(Date.now() / 1000) + minutes * 60;
+
+    try {
+      await bot.api.restrictChatMember(
+        message.chat.id,
+        message.from.id,
+        MUTE_PERMISSIONS,
+        { until_date: untilDate }
+      );
+
+      await bot.api.sendMessage(
+        message.chat.id,
+        `${pickRandom(NON_ADMIN_MUTE_PUNISHMENTS)} Мут на ${minutes} мин.`,
+        buildReplyOptions(message)
+      );
+    } catch (error) {
+      await bot.api.sendMessage(
+        message.chat.id,
+        `Хотела заварить, но Telegram не дал: ${error.message}`,
+        buildReplyOptions(message)
       );
     }
   }
@@ -712,6 +820,33 @@ function buildLefFrameText(target, variant, frame, index) {
     `Тип: ${variant}`,
     `Прогресс: ${progress}`
   ].join('\n');
+}
+
+async function sendRandomReply(api, message, replies) {
+  await api.sendMessage(
+    message.chat.id,
+    pickRandom(replies),
+    buildReplyOptions(message)
+  );
+}
+
+function buildReplyOptions(message) {
+  return {
+    reply_to_message_id: message.message_id,
+    allow_sending_without_reply: true
+  };
+}
+
+function pickRandom(items) {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function getUnauthorizedMuteMinutes(attemptCount) {
+  const index = Math.max(0, attemptCount - 2);
+
+  return NON_ADMIN_MUTE_ESCALATION_MINUTES[
+    Math.min(index, NON_ADMIN_MUTE_ESCALATION_MINUTES.length - 1)
+  ];
 }
 
 async function getRandomLefImage(lefAssetsPath) {
