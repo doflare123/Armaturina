@@ -9,14 +9,22 @@
 3. Установи зависимости и запусти:
 
 ```bash
-npm install
-npm start
+bun install
+bun start
 ```
 
-Если в одном контейнере запускается несколько ботов, можно импортировать Арматурину в главный ESM-файл:
+Проект на TypeScript и не привязан к конкретному рантайму:
 
-```js
-import { armaturina } from './armaturina/src/index.js';
+- **Bun** без шага сборки: `bun start` (= `bun run src/index.ts`).
+- **Node 24+** запускает исходники напрямую (нативный strip типов): `node src/index.ts`.
+- **Сборка для Node**: `bun run build` (или `tsgo -p tsconfig.build.json`) кладет чистый JS в `dist/`, дальше `node dist/index.js` — без зависимости от Bun.
+
+В коде нет ни одного `Bun.*` API; все зависимости — обычные npm-пакеты.
+
+Если в одном контейнере запускается несколько ботов, можно импортировать Арматурину в главный ESM-файл (под Bun — прямо из исходников):
+
+```ts
+import { armaturina } from './armaturina/src/index.ts';
 
 await armaturina();
 ```
@@ -25,8 +33,8 @@ await armaturina();
 
 Если не хочешь использовать env-переменные, передай настройки явно:
 
-```js
-import { armaturina } from './armaturina/src/index.js';
+```ts
+import { armaturina } from './armaturina/src/index.ts';
 
 await armaturina({
   token: process.env.ARMATURINA_BOT_TOKEN,
@@ -120,3 +128,24 @@ DATA_FILE=data/media-pool.json
 ```
 
 Последние сообщения пользователей хранятся только в памяти процесса. После рестарта бот снова начнет запоминать последние сообщения по мере активности в группе.
+
+## Разработка
+
+Код на TypeScript, разбит по слоям:
+
+- `src/parser/` - разбор команд и фраз в типизированные `Action`.
+- `src/store/` - пул медиа (`MediaPool`), статистика (`StatsStore`) и запись в JSON (`FileStore`).
+- `src/services/` - Gemini, добавление стикеров/гифок, проверка админов.
+- `src/bot/` - сборка бота, роутинг сообщений (`dispatch.ts`) и обработчики (`handlers/`).
+- `src/tags.ts`, `src/util/` - общий словарь тегов и мелкие утилиты.
+
+Скрипты:
+
+```bash
+bun run typecheck   # проверка типов через tsgo (нативный компилятор TypeScript)
+bun test            # тесты под Bun...
+node --test 'tests/**/*.test.ts'   # ...или под Node (тесты на node:test, работают в обоих)
+bun run lint        # Biome: линт + формат-проверка
+bun run lint:fix    # автofix + формат
+bun run build       # сборка в dist/ для Node
+```
