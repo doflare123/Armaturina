@@ -1,4 +1,5 @@
 import { Bot, InputFile } from 'grammy';
+import { run, sequentialize } from '@grammyjs/runner';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { FileStore } from './store/fileStore.js';
@@ -90,7 +91,7 @@ function createBot(config) {
   });
   let botInfo = null;
   let started = false;
-  let pollingPromise = null;
+  let runner = null;
 
   async function start() {
     if (started) {
@@ -98,7 +99,17 @@ function createBot(config) {
     }
 
     await store.load();
-    botInfo = await bot.api.getMe();
+    await bot.init();
+    botInfo = bot.botInfo;
+
+    // Process updates from different chats concurrently so a long animation or
+    // Gemini call in one chat never freezes the bot for everyone else. Updates
+    // within a single chat stay ordered so stats and "last message" stay correct.
+    bot.use(sequentialize((ctx) => {
+      const chatId = ctx.chat?.id;
+
+      return chatId === undefined ? undefined : String(chatId);
+    }));
 
     bot.on('message', async (ctx) => {
       await handleMessage(ctx.message);
@@ -109,8 +120,8 @@ function createBot(config) {
     });
 
     started = true;
-    pollingPromise = bot.start();
-    pollingPromise.catch((error) => {
+    runner = run(bot);
+    runner.task().catch((error) => {
       console.error('Armaturina polling stopped with error:', error);
     });
 
@@ -122,7 +133,7 @@ function createBot(config) {
       return;
     }
 
-    await bot.stop();
+    await runner.stop();
     started = false;
   }
 
@@ -801,7 +812,7 @@ function createBot(config) {
     bot,
     store,
     get pollingPromise() {
-      return pollingPromise;
+      return runner ? runner.task() : null;
     }
   };
 }
@@ -984,12 +995,7 @@ function delay(ms) {
 }
 
 function isChatAdminRequiredError(error) {
-  return error && (
-    error.error_code === 400 ||
-    error.errorCode === 400 ||
-    error.description ||
-    error.message
-  ) && String(error.description || error.message || '').includes('CHAT_ADMIN_REQUIRED');
+  return getTelegramErrorText(error).includes('CHAT_ADMIN_REQUIRED');
 }
 
 function isTargetAdminError(error) {

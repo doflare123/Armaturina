@@ -13,7 +13,15 @@ export async function armaturina(options = {}) {
 }
 
 async function main() {
-  await armaturina();
+  const bot = await armaturina();
+
+  const shutdown = async () => {
+    await bot.stop();
+    process.exit(0);
+  };
+
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 const currentFilePath = fileURLToPath(import.meta.url);
@@ -21,7 +29,7 @@ const startedDirectly = process.argv[1] && currentFilePath === path.resolve(proc
 
 if (startedDirectly) {
   main().catch((error) => {
-  console.error('Armaturina failed to start:', error);
-  process.exitCode = 1;
+    console.error('Armaturina failed to start:', error);
+    process.exitCode = 1;
   });
 }

@@ -461,7 +461,7 @@ function normalizeTags(tags = []) {
     (Array.isArray(tags) ? tags : [])
       .map((tag) => String(tag).trim().toLowerCase())
       .filter(Boolean)
-      .slice(0, 12)
+      .slice(0, 8)
   )];
 }
 

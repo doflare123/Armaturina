@@ -6,6 +6,8 @@ class FileStore extends MemoryStore {
   constructor(filePath) {
     super();
     this.filePath = filePath;
+    this.savePromise = Promise.resolve();
+    this.saveCounter = 0;
   }
 
   async load() {
@@ -24,9 +26,21 @@ class FileStore extends MemoryStore {
     }
   }
 
-  async save() {
+  save() {
+    // Serialize writes so concurrent updates can never rename the same temp
+    // file out from under each other. Each queued write exports a fresh
+    // snapshot, so callers always persist the latest in-memory state.
+    this.savePromise = this.savePromise
+      .catch(() => {})
+      .then(() => this.writeFile());
+
+    return this.savePromise;
+  }
+
+  async writeFile() {
     const directoryPath = path.dirname(this.filePath);
-    const temporaryPath = `${this.filePath}.tmp`;
+    this.saveCounter += 1;
+    const temporaryPath = `${this.filePath}.${process.pid}.${this.saveCounter}.tmp`;
     const data = JSON.stringify(this.exportMediaPool(), null, 2);
 
     // Atomic replace keeps the pool readable even if the process stops mid-save.
