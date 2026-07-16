@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import type { Sticker, User } from 'grammy/types';
+import type { Message, Sticker, User } from 'grammy/types';
 import { type MediaPoolImport, MemoryStore } from '../src/store/memoryStore.ts';
 import type { MediaMetadata, ResolvedTarget } from '../src/types.ts';
 
@@ -33,6 +33,16 @@ function target(userId: number, username: string): ResolvedTarget {
 
 function user(id: number, username: string): User {
   return { id, is_bot: false, first_name: 'U', username } as unknown as User;
+}
+
+function chatMessage(messageId: number, userId: number, date: number): Message {
+  return {
+    message_id: messageId,
+    date,
+    chat: { id: 1, type: 'supergroup', title: 'Test' },
+    from: { id: userId, is_bot: false, first_name: 'U', username: `user${userId}` },
+    text: `message ${messageId}`,
+  } as unknown as Message;
 }
 
 describe('media pools', () => {
@@ -126,6 +136,31 @@ describe('moderation abuse', () => {
 
     const afterWindow = 2_000 + 31 * 60 * 1_000;
     assert.equal((await store.recordModerationAbuse(1, abuser, afterWindow)).count, 1);
+  });
+});
+
+describe('recent message history', () => {
+  test('keeps deletable message ids per chat and user', () => {
+    const store = new MemoryStore();
+    const now = 2_000_000;
+
+    store.rememberMessage(chatMessage(10, 7, now - 10));
+    store.rememberMessage(chatMessage(11, 7, now));
+    store.rememberMessage(chatMessage(12, 8, now));
+
+    assert.deepEqual(store.getRecentMessageIds(1, 7, now), [10, 11]);
+    assert.deepEqual(store.getRecentMessageIds(1, 8, now), [12]);
+    assert.deepEqual(store.getRecentMessageIds(2, 7, now), []);
+  });
+
+  test('drops messages outside Telegram deletion window', () => {
+    const store = new MemoryStore();
+    const now = 2_000_000;
+
+    store.rememberMessage(chatMessage(10, 7, now - 48 * 60 * 60 - 1));
+    store.rememberMessage(chatMessage(11, 7, now));
+
+    assert.deepEqual(store.getRecentMessageIds(1, 7, now), [11]);
   });
 });
 

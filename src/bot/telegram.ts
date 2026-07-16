@@ -19,6 +19,27 @@ export async function canBotModerate(deps: BotDeps, chatId: number): Promise<boo
   }
 }
 
+/** Whether a ban can also fulfil its promise to remove the member's messages. */
+export async function canBotBanAndDelete(deps: BotDeps, chatId: number): Promise<boolean> {
+  try {
+    const botInfo = await deps.getBotInfo();
+    const member = await deps.api.getChatMember(chatId, botInfo.id);
+
+    if (member.status === 'creator') {
+      return true;
+    }
+
+    return (
+      member.status === 'administrator' &&
+      Boolean(member.can_restrict_members) &&
+      Boolean(member.can_delete_messages)
+    );
+  } catch (error) {
+    console.error('Failed to check bot ban/delete permissions:', error);
+    return false;
+  }
+}
+
 /**
  * Whether `target` may be moderated. Admins/owners can't be, so this also warns
  * the chat and returns `false` for them. Errors default to allowing the attempt.

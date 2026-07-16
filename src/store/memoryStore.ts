@@ -1,4 +1,5 @@
 import type { Message, Sticker, User } from 'grammy/types';
+import { MAX_RECENT_MESSAGES_PER_USER, MESSAGE_DELETE_WINDOW_SECONDS } from '../constants.ts';
 import type { MediaItem, MediaMetadata, Pool, ResolvedTarget, Target } from '../types.ts';
 import { normalizeUsername } from './keys.ts';
 import { MediaPool, type RawMedia } from './mediaPool.ts';
@@ -16,6 +17,11 @@ interface LastMessage {
   userId: number;
   username: string | null;
   text: string;
+}
+
+interface RecentMessage {
+  messageId: number;
+  date: number;
 }
 
 export interface PoolSummary {
@@ -65,6 +71,7 @@ export class MemoryStore {
   // Last messages are chat-scoped because replies must land in the same group.
   private readonly lastByUserId = new Map<number, Map<number, LastMessage>>();
   private readonly lastByUsername = new Map<number, Map<string, LastMessage>>();
+  private readonly recentByUserId = new Map<number, Map<number, RecentMessage[]>>();
 
   /** Overridden by persistent subclasses; here it does nothing. */
   protected async persist(): Promise<void> {}
@@ -90,6 +97,14 @@ export class MemoryStore {
         last,
       );
     }
+
+    const recentByUser = getOrCreateMap(this.recentByUserId, chatId);
+    const cutoff = message.date - MESSAGE_DELETE_WINDOW_SECONDS;
+    const recent = (recentByUser.get(message.from.id) ?? []).filter(
+      (item) => item.date >= cutoff && item.messageId !== message.message_id,
+    );
+    recent.push({ messageId: message.message_id, date: message.date });
+    recentByUser.set(message.from.id, recent.slice(-MAX_RECENT_MESSAGES_PER_USER));
   }
 
   getLastMessage(
@@ -112,6 +127,24 @@ export class MemoryStore {
     }
 
     return this.lastByUsername.get(chatId)?.get(normalizeUsername(target.username)) ?? null;
+  }
+
+  /** Message ids the bot can still explicitly delete if Telegram's ban cleanup misses them. */
+  getRecentMessageIds(
+    chatId: number,
+    userId: number,
+    now = Math.floor(Date.now() / 1_000),
+  ): number[] {
+    const recentByUser = this.recentByUserId.get(chatId);
+    const messages = recentByUser?.get(userId) ?? [];
+    const cutoff = now - MESSAGE_DELETE_WINDOW_SECONDS;
+    const fresh = messages.filter((item) => item.date >= cutoff);
+
+    if (recentByUser && fresh.length !== messages.length) {
+      recentByUser.set(userId, fresh);
+    }
+
+    return fresh.map((item) => item.messageId);
   }
 
   async addStickerSet(

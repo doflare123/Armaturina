@@ -18,6 +18,11 @@ export const MODERATION_ABUSE_WINDOW_MS = 30 * 60 * 1_000;
 /** Telegram caps mutes at 30 days. */
 export const MAX_MUTE_MINUTES = 43_200;
 
+/** Telegram only allows ordinary message deletion during the first 48 hours. */
+export const MESSAGE_DELETE_WINDOW_SECONDS = 48 * 60 * 60;
+/** Bound per-user message history kept only for ban cleanup. */
+export const MAX_RECENT_MESSAGES_PER_USER = 1_000;
+
 /** Full lockdown permissions applied on mute. */
 export const MUTE_PERMISSIONS: ChatPermissions = {
   can_send_messages: false,

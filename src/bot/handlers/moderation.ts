@@ -1,5 +1,9 @@
 import type { Message } from 'grammy/types';
-import { MUTE_PERMISSIONS, NON_ADMIN_MUTE_ESCALATION_MINUTES } from '../../constants.ts';
+import {
+  MESSAGE_DELETE_WINDOW_SECONDS,
+  MUTE_PERMISSIONS,
+  NON_ADMIN_MUTE_ESCALATION_MINUTES,
+} from '../../constants.ts';
 import { NON_ADMIN_MUTE_PUNISHMENTS, NON_ADMIN_MUTE_WARNINGS } from '../../messages.ts';
 import type { BanAction, ModerationTarget, MuteAction, Target } from '../../types.ts';
 import { errorMessage } from '../../util/errors.ts';
@@ -8,6 +12,7 @@ import { formatDuration } from '../../util/time.ts';
 import type { BotDeps } from '../deps.ts';
 import { replyToSender, sendRandomReply } from '../replies.ts';
 import {
+  canBotBanAndDelete,
   canBotModerate,
   canModerateTarget,
   isChatAdminRequiredError,
@@ -94,10 +99,10 @@ export async function handleBan(deps: BotDeps, message: Message, action: BanActi
     return;
   }
 
-  if (!(await canBotModerate(deps, chatId))) {
+  if (!(await canBotBanAndDelete(deps, chatId))) {
     await deps.api.sendMessage(
       chatId,
-      'Не могу банить: сделай бота админом и включи ему право банить/ограничивать участников.',
+      'Не могу забанить с очисткой сообщений: дай боту права банить участников и удалять сообщения.',
     );
     return;
   }
@@ -108,7 +113,6 @@ export async function handleBan(deps: BotDeps, message: Message, action: BanActi
 
   try {
     await deps.api.banChatMember(chatId, target.userId, { revoke_messages: true });
-    await deps.api.sendMessage(chatId, `Уебала ${target.label} из чата.`);
   } catch (error) {
     if (isTargetAdminError(error)) {
       await sendTargetAdminError(deps.api, chatId, target, 'забанить');
@@ -126,6 +130,18 @@ export async function handleBan(deps: BotDeps, message: Message, action: BanActi
     await deps.api.sendMessage(
       chatId,
       `Не смогла забанить ${target.label}: ${errorMessage(error)}`,
+    );
+    return;
+  }
+
+  try {
+    const messageIds = getBanCleanupMessageIds(deps, message, target.userId);
+    await deleteMessagesInBatches(deps, chatId, messageIds);
+    await deps.api.sendMessage(chatId, `Уебала ${target.label} из чата.`);
+  } catch (error) {
+    await deps.api.sendMessage(
+      chatId,
+      `Забанила ${target.label}, но не смогла дочистить его сообщения: ${errorMessage(error)}`,
     );
   }
 }
@@ -211,4 +227,26 @@ function getUnauthorizedMuteMinutes(attemptCount: number): number {
   const clamped = Math.min(index, NON_ADMIN_MUTE_ESCALATION_MINUTES.length - 1);
 
   return NON_ADMIN_MUTE_ESCALATION_MINUTES.at(clamped) ?? 30;
+}
+
+function getBanCleanupMessageIds(deps: BotDeps, message: Message, userId: number): number[] {
+  const messageIds = new Set(deps.store.getRecentMessageIds(message.chat.id, userId));
+  const reply = message.reply_to_message;
+  const cutoff = Math.floor(Date.now() / 1_000) - MESSAGE_DELETE_WINDOW_SECONDS;
+
+  if (reply?.from?.id === userId && reply.date >= cutoff) {
+    messageIds.add(reply.message_id);
+  }
+
+  return [...messageIds];
+}
+
+async function deleteMessagesInBatches(
+  deps: BotDeps,
+  chatId: number,
+  messageIds: number[],
+): Promise<void> {
+  for (let index = 0; index < messageIds.length; index += 100) {
+    await deps.api.deleteMessages(chatId, messageIds.slice(index, index + 100));
+  }
 }
