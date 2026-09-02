@@ -3,7 +3,9 @@ import { describe, test } from 'node:test';
 import type { Api } from 'grammy';
 import type { Message } from 'grammy/types';
 import type { BotDeps } from '../src/bot/deps.ts';
+import { handleMessage } from '../src/bot/dispatch.ts';
 import { handleBan } from '../src/bot/handlers/moderation.ts';
+import { AdminChecker } from '../src/services/admin.ts';
 import { MemoryStore } from '../src/store/memoryStore.ts';
 
 const CHAT_ID = -100123;
@@ -45,6 +47,9 @@ function createDeps(canDeleteMessages = true): {
   const store = new MemoryStore();
   const calls: ApiCalls = { bans: [], deletions: [], sent: [] };
   const api = {
+    async getChatAdministrators() {
+      return [{ status: 'creator', user: { id: 1, is_bot: false, first_name: 'Admin' } }];
+    },
     async getChatMember(_chatId: number | string, userId: number) {
       if (userId === BOT_ID) {
         return {
@@ -76,6 +81,7 @@ function createDeps(canDeleteMessages = true): {
   const deps = {
     api,
     store,
+    admins: new AdminChecker(api),
     getBotInfo: async () => ({ id: BOT_ID }),
   } as unknown as BotDeps;
 
@@ -83,6 +89,31 @@ function createDeps(canDeleteMessages = true): {
 }
 
 describe('ban cleanup', () => {
+  test('a reply ban phrase deletes a fresh message even with an empty store', async () => {
+    const { deps, calls } = createDeps();
+    const command = { ...banCommand(userMessage(12)), text: 'арматурина уеби' };
+
+    await handleMessage(deps, command);
+
+    assert.deepEqual(calls.bans, [{ chatId: CHAT_ID, userId: USER_ID, revokeMessages: true }]);
+    assert.deepEqual(calls.deletions, [{ chatId: CHAT_ID, messageIds: [12] }]);
+    assert.deepEqual(calls.sent, ['Уебала @target из чата.']);
+  });
+
+  test('a reply ban phrase reports cleanup failure after a successful ban', async () => {
+    const { deps, calls } = createDeps();
+    deps.api.deleteMessages = async () => {
+      throw new Error("Bad Request: message can't be deleted");
+    };
+
+    await handleMessage(deps, { ...banCommand(userMessage(12)), text: 'арматурина уеби' });
+
+    assert.equal(calls.bans.length, 1);
+    assert.equal(calls.sent.length, 1);
+    assert.match(calls.sent[0] ?? '', /Забанила @target, но не смогла дочистить/);
+    assert.match(calls.sent[0] ?? '', /message can't be deleted/);
+  });
+
   test('bans with revoke and explicitly deletes remembered and replied-to messages', async () => {
     const { deps, store, calls } = createDeps();
     store.rememberMessage(userMessage(10));
