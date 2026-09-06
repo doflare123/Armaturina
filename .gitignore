@@ -8,3 +8,6 @@ package-lock.json
 dist/
 .idea/
 *.tmp
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

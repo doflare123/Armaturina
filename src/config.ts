@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadSpamConfig } from './antispam/config.ts';
 import type { Config } from './types.ts';
 
 export interface ConfigOptions {
@@ -45,6 +46,7 @@ export function loadConfig(options: ConfigOptions = {}): Config {
   );
 
   return {
+    antispam: loadSpamConfig(),
     token,
     dataFilePath: toAbsolute(dataFilePath),
     lefAssetsPath: toAbsolute(lefAssetsPath),

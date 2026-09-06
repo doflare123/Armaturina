@@ -1,6 +1,7 @@
 import { type RunnerHandle, run, sequentialize } from '@grammyjs/runner';
 import { Bot } from 'grammy';
 import type { UserFromGetMe } from 'grammy/types';
+import type { SpamTelegram } from '../antispam/telegram.ts';
 import { AdminChecker } from '../services/admin.ts';
 import { GeminiService } from '../services/gemini.ts';
 import { FileStore } from '../store/fileStore.ts';
@@ -26,6 +27,7 @@ export function createBot(config: Config): Armaturina {
   let botInfo: UserFromGetMe | null = null;
   let started = false;
   let runner: RunnerHandle | null = null;
+  let antispam: SpamTelegram | undefined;
 
   const deps: BotDeps = {
     api: bot.api,
@@ -47,6 +49,10 @@ export function createBot(config: Config): Armaturina {
     await store.load();
     await bot.init();
     botInfo = bot.botInfo;
+    if (config.antispam) {
+      const { SpamTelegram } = await import('../antispam/telegram.ts');
+      antispam = new SpamTelegram(bot.api, config.antispam);
+    }
 
     // Process updates from different chats concurrently so a slow animation or
     // Gemini call in one chat never freezes the bot for everyone else. Updates
@@ -58,7 +64,31 @@ export function createBot(config: Config): Armaturina {
       }),
     );
 
-    bot.on('message', (ctx) => handleMessage(deps, ctx.message));
+    bot.on('message', async (ctx) => {
+      if (antispam) {
+        try {
+          if (await antispam.message(ctx.message, bot.botInfo.username)) return;
+        } catch {
+          console.error('antispam_message_failed');
+          if (/^\/spam(?:@|\s|$)/i.test(ctx.message.text ?? '')) return;
+        }
+      }
+      await handleMessage(deps, ctx.message);
+    });
+    bot.on('callback_query:data', async (ctx) => {
+      try {
+        await antispam?.callback(ctx.callbackQuery);
+      } catch {
+        console.error('antispam_callback_failed');
+      }
+    });
+    bot.on('edited_message', (ctx) => {
+      try {
+        antispam?.edited(ctx.editedMessage);
+      } catch {
+        console.error('antispam_edit_failed');
+      }
+    });
     bot.catch((error) => {
       console.error('Telegram bot error:', error.error);
     });
@@ -78,6 +108,8 @@ export function createBot(config: Config): Armaturina {
     }
 
     await runner.stop();
+    antispam?.close();
+    antispam = undefined;
     started = false;
   }
 

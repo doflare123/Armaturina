@@ -92,6 +92,7 @@ export interface GeminiConfig {
 }
 
 export interface Config {
+  antispam?: import('./antispam/config.ts').SpamConfig;
   token: string;
   dataFilePath: string;
   lefAssetsPath: string;
