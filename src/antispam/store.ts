@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Message } from 'grammy/types';
+import { type ModelArtifact, type Sample, validateModel } from './model.ts';
 import { normalizeMessage } from './normalizer.ts';
 
 export type Verdict = 'spam' | 'normal' | 'skip';
@@ -29,8 +30,10 @@ export class SpamStore {
     try {
       this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;');
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version;
-      if (version !== 0 && version !== 1) throw new Error('Unsupported antispam schema version');
+      if (version !== 0 && version !== 1 && version !== 2)
+        throw new Error('Unsupported antispam schema version');
       if (version === 0) this.migrate();
+      if (version === 0 || version === 1) this.migrateModels();
     } catch (error) {
       this.db.close();
       throw error;
@@ -86,6 +89,80 @@ export class SpamStore {
     `);
   }
 
+  private migrateModels() {
+    this.db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE model_versions (
+        version TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, trained_at INTEGER NOT NULL,
+        artifact_json TEXT NOT NULL, metrics_json TEXT NOT NULL, dataset_hash TEXT NOT NULL,
+        active INTEGER NOT NULL CHECK(active IN (0,1))
+      );
+      CREATE UNIQUE INDEX model_active_chat ON model_versions(chat_id) WHERE active=1;
+      CREATE TABLE predictions (
+        id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+        model_version TEXT NOT NULL REFERENCES model_versions(version),
+        classifier_score REAL CHECK(classifier_score BETWEEN 0 AND 1),
+        decision TEXT NOT NULL CHECK(decision IN ('ALLOW','ASK_ADMIN')),
+        reason TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      ALTER TABLE moderation_cases ADD COLUMN prediction_id INTEGER REFERENCES predictions(id) ON DELETE SET NULL;
+      PRAGMA user_version=2;
+      COMMIT;`);
+  }
+
+  activeModel(chatId: number, knownVersion?: string) {
+    return this.db
+      .prepare(
+        'SELECT version,artifact_json,metrics_json FROM model_versions WHERE chat_id=? AND active=1 AND version<>?',
+      )
+      .get(chatId, knownVersion ?? '') as
+      | { version: string; artifact_json: string; metrics_json: string }
+      | undefined;
+  }
+
+  activateModel(chatId: number, input: ModelArtifact, datasetHash: string): string {
+    const model = validateModel(input);
+    const version = randomUUID();
+    this.transaction(() => {
+      this.db.prepare('UPDATE model_versions SET active=0 WHERE chat_id=?').run(chatId);
+      this.db
+        .prepare('INSERT INTO model_versions VALUES (?,?,?,?,?,?,1)')
+        .run(
+          version,
+          chatId,
+          Date.now(),
+          JSON.stringify(model),
+          JSON.stringify(model.metrics),
+          datasetHash,
+        );
+    });
+    return version;
+  }
+
+  prediction(
+    messageId: number,
+    version: string,
+    score: number | null,
+    decision: string,
+    reason: string,
+  ): number | null {
+    const inserted = this.db
+      .prepare(`INSERT INTO predictions(message_id,model_version,classifier_score,decision,reason,created_at)
+      SELECT id,?,?,?,?,? FROM messages WHERE id=? AND chat_id=(SELECT chat_id FROM model_versions WHERE version=?)
+      ON CONFLICT(message_id) DO NOTHING`)
+      .run(version, score, decision, reason, Date.now(), messageId, version);
+    return inserted.changes ? Number(inserted.lastInsertRowid) : null;
+  }
+
+  canPropose(chatId: number, now = Date.now()): boolean {
+    this.expire(now);
+    const row = this.db
+      .prepare(`SELECT COUNT(CASE WHEN c.status='PENDING' THEN 1 END) AS pending,
+      MAX(CASE WHEN c.prediction_id IS NOT NULL THEN c.created_at END) AS last
+      FROM moderation_cases c JOIN messages m ON m.id=c.message_id WHERE m.chat_id=?`)
+      .get(chatId);
+    return Number(row?.pending ?? 0) < 20 && Number(row?.last ?? 0) <= now - 60_000;
+  }
+
   capture(message: Message): number | null {
     const raw = message.text ?? message.caption;
     if (raw === undefined || !raw.trim()) return null;
@@ -133,12 +210,12 @@ export class SpamStore {
     return Number(row?.id);
   }
 
-  createCase(messageId: number, now = Date.now()): ReviewCase {
+  createCase(messageId: number, now = Date.now(), predictionId: number | null = null): ReviewCase {
     this.expire(now);
     this.db
-      .prepare(`INSERT INTO moderation_cases(id,message_id,created_at,expires_at)
-      VALUES (?,?,?,?) ON CONFLICT DO NOTHING`)
-      .run(randomUUID(), messageId, now, now + 30 * 60_000);
+      .prepare(`INSERT INTO moderation_cases(id,message_id,created_at,expires_at,prediction_id)
+      VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`)
+      .run(randomUUID(), messageId, now, now + 30 * 60_000, predictionId);
     return this.db
       .prepare(`SELECT c.*,m.chat_id,m.telegram_message_id,m.user_id,m.sender_chat_id,m.raw_text
       FROM moderation_cases c JOIN messages m ON m.id=c.message_id WHERE c.message_id=?
@@ -265,7 +342,9 @@ export class SpamStore {
   }
 
   dataset(chatId: number) {
-    return this.db.prepare('SELECT * FROM training_dataset WHERE chat_id=?').all(chatId);
+    return this.db
+      .prepare('SELECT * FROM training_dataset WHERE chat_id=? ORDER BY text_hash')
+      .all(chatId) as unknown as Sample[];
   }
 
   stats(chatId: number) {

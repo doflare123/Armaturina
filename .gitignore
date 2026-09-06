@@ -11,3 +11,4 @@ dist/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+.venv-antispam/

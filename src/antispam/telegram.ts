@@ -1,13 +1,17 @@
 import type { Api } from 'grammy';
 import type { CallbackQuery, Message } from 'grammy/types';
 import type { SpamConfig } from './config.ts';
+import { decide } from './decision.ts';
+import { LearningService } from './learning.ts';
 import { SpamStore, type Verdict } from './store.ts';
 
-/** Manual LEARNING adapter. No classifier, external AI, or automatic punishment. */
+/** LEARNING adapter: local model suggestions, human feedback, no automatic punishment. */
 export class SpamTelegram {
   private readonly api: Api;
   private readonly config: SpamConfig;
   readonly store: SpamStore;
+  readonly learning: LearningService;
+  private closed = false;
   private readonly timer: ReturnType<typeof setInterval>;
 
   constructor(api: Api, config: SpamConfig) {
@@ -15,6 +19,8 @@ export class SpamTelegram {
     this.config = config;
     this.store = new SpamStore(config.databasePath);
     this.store.prune(config.retentionDays);
+    this.learning = new LearningService(this.store);
+    for (const chatId of config.chatIds) this.learning.current(chatId);
     this.timer = setInterval(() => {
       try {
         this.store.prune(config.retentionDays);
@@ -49,7 +55,17 @@ export class SpamTelegram {
     if (!this.enabled(message)) return false;
     const command = /^\/spam(?:@([a-z0-9_]+))?(?:\s+(.*))?$/iu.exec(message.text ?? '');
     if (!command) {
-      if (!message.from?.is_bot || message.sender_chat) this.store.capture(message);
+      if (!message.from?.is_bot || message.sender_chat) {
+        const id = this.store.capture(message);
+        if (
+          id !== null &&
+          message.from &&
+          !message.from.is_bot &&
+          !message.sender_chat &&
+          !/^\//.test(message.text ?? '')
+        )
+          await this.suggest(message, id);
+      }
       return false;
     }
     if (command[1] && command[1].toLowerCase() !== botUsername.toLowerCase()) return true;
@@ -66,11 +82,41 @@ export class SpamTelegram {
       return true;
     }
     const arg = command[2]?.trim() ?? 'status';
+    if (arg === 'train') {
+      // Do not hold the per-chat update queue while CPU work runs in another thread.
+      const task = this.learning.train(message.chat.id);
+      void task
+        .then(
+          async (version) => {
+            if (!this.closed)
+              await this.api.sendMessage(
+                message.chat.id,
+                `Модель ${version} обучена. Включены только предложения, автоудаление отключено.`,
+              );
+          },
+          async (error: Error) => {
+            if (!this.closed)
+              await this.api.sendMessage(
+                message.chat.id,
+                `Обучение не завершено: ${error.message}`,
+              );
+          },
+        )
+        .catch(() => {
+          console.error('antispam_training_notification_failed');
+        });
+      return true;
+    }
     if (arg === 'status' || arg === 'stats') {
       const stats = this.store.stats(message.chat.id);
+      const current = this.learning.current(message.chat.id);
+      const metrics = current?.classifier.model.metrics;
       await this.api.sendMessage(
         message.chat.id,
-        `Антиспам: LEARNING, модель: COLD_START. Автоудаление отключено.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}\nУникальных normal: ${stats?.normal}\nОжидают решения: ${stats?.pending}`,
+        `Антиспам: LEARNING, модель: ${current?.version ?? 'COLD_START'}. Автоудаление отключено.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}/50\nУникальных normal: ${stats?.normal}/200\nОжидают решения: ${stats?.pending}` +
+          (metrics
+            ? `\nValidation при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭто экспериментальная оценка; автоматические наказания запрещены.`
+            : '\nДля первого обучения: /spam train'),
       );
       return true;
     }
@@ -89,7 +135,7 @@ export class SpamTelegram {
     if (arg !== 'review' || !message.reply_to_message) {
       await this.api.sendMessage(
         message.chat.id,
-        '/spam review — ответом на сообщение для разметки.\n/spam status\n/spam stats\n/spam undo <id решения>',
+        '/spam review — ответом на сообщение для разметки.\n/spam train\n/spam status\n/spam stats\n/spam undo <id решения>',
       );
       return true;
     }
@@ -121,9 +167,43 @@ export class SpamTelegram {
       );
       return true;
     }
+    await this.sendCard(item, 'Ручная разметка');
+    return true;
+  }
+
+  private async suggest(message: Message, messageId: number) {
+    const current = this.learning.current(message.chat.id);
+    if (!current) return;
+    const score = current.classifier.classify(message.text ?? message.caption ?? '');
+    let protectedUser = true;
+    try {
+      const member = await this.api.getChatMember(message.chat.id, message.from?.id ?? 0);
+      protectedUser = member.status === 'administrator' || member.status === 'creator';
+    } catch {
+      /* Unknown permissions suppress suggestions. */
+    }
+    const result = decide(score, protectedUser);
+    const limited = result.decision === 'ASK_ADMIN' && !this.store.canPropose(message.chat.id);
+    const predictionId = this.store.prediction(
+      messageId,
+      current.version,
+      score,
+      result.decision,
+      limited ? 'review_rate_limited' : result.reason,
+    );
+    if (predictionId === null || limited || result.decision !== 'ASK_ADMIN') return;
+    const item = this.store.createCase(messageId, Date.now(), predictionId);
+    if (item.card_id !== null || item.status !== 'PENDING') return;
+    await this.sendCard(
+      item,
+      `Возможный спам — нужна проверка администратора.\nОценка модели: ${((score ?? 0) * 100).toFixed(1)}% (не гарантия).\nМодель: ${current.version}`,
+    );
+  }
+
+  private async sendCard(item: import('./store.ts').ReviewCase, title: string) {
     const card = await this.api.sendMessage(
-      message.chat.id,
-      `Ручная разметка (30 минут).\nID: ${item.id}\n\n${item.raw_text.slice(0, 2800)}`,
+      item.chat_id,
+      `${title} (30 минут).\nID: ${item.id}\n\n${item.raw_text.slice(0, 2800)}`,
       {
         link_preview_options: { is_disabled: true },
         reply_markup: {
@@ -138,7 +218,6 @@ export class SpamTelegram {
       },
     );
     this.store.bindCard(item.id, card.message_id);
-    return true;
   }
 
   async callback(query: CallbackQuery): Promise<void> {
@@ -220,7 +299,9 @@ export class SpamTelegram {
   }
 
   close() {
+    this.closed = true;
     clearInterval(this.timer);
+    this.learning.close();
     this.store.close();
   }
 }
