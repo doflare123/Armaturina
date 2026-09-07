@@ -18,6 +18,8 @@ export interface ReviewCase {
   status: string;
   card_id: number | null;
   expires_at: number;
+  revision: number;
+  metadata: string;
 }
 
 /** SQLite owns arbitration; no network request is made inside a transaction. */
@@ -30,10 +32,11 @@ export class SpamStore {
     try {
       this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;');
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version;
-      if (version !== 0 && version !== 1 && version !== 2)
+      if (version !== 0 && version !== 1 && version !== 2 && version !== 3)
         throw new Error('Unsupported antispam schema version');
       if (version === 0) this.migrate();
       if (version === 0 || version === 1) this.migrateModels();
+      if (version === 0 || version === 1 || version === 2) this.migrateRevisions();
     } catch (error) {
       this.db.close();
       throw error;
@@ -119,6 +122,23 @@ export class SpamStore {
       | undefined;
   }
 
+  private migrateRevisions() {
+    this.db.exec(`BEGIN IMMEDIATE;
+      ALTER TABLE messages ADD COLUMN source_message_id INTEGER;
+      ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE messages ADD COLUMN last_update_id INTEGER;
+      UPDATE messages SET source_message_id=telegram_message_id;
+      CREATE INDEX messages_revisions ON messages(chat_id,source_message_id,revision);
+      PRAGMA user_version=3;
+      COMMIT;`);
+  }
+
+  isCurrent(messageId: number): boolean {
+    return !!this.db
+      .prepare('SELECT 1 FROM messages WHERE id=? AND telegram_message_id IS NOT NULL')
+      .get(messageId);
+  }
+
   activateModel(chatId: number, input: ModelArtifact, datasetHash: string): string {
     const model = validateModel(input);
     const version = randomUUID();
@@ -147,7 +167,8 @@ export class SpamStore {
   ): number | null {
     const inserted = this.db
       .prepare(`INSERT INTO predictions(message_id,model_version,classifier_score,decision,reason,created_at)
-      SELECT id,?,?,?,?,? FROM messages WHERE id=? AND chat_id=(SELECT chat_id FROM model_versions WHERE version=?)
+      SELECT id,?,?,?,?,? FROM messages WHERE id=? AND telegram_message_id IS NOT NULL
+      AND chat_id=(SELECT chat_id FROM model_versions WHERE version=?)
       ON CONFLICT(message_id) DO NOTHING`)
       .run(version, score, decision, reason, Date.now(), messageId, version);
     return inserted.changes ? Number(inserted.lastInsertRowid) : null;
@@ -163,61 +184,104 @@ export class SpamStore {
     return Number(row?.pending ?? 0) < 20 && Number(row?.last ?? 0) <= now - 60_000;
   }
 
-  capture(message: Message): number | null {
-    const raw = message.text ?? message.caption;
-    if (raw === undefined || !raw.trim()) return null;
+  capture(message: Message, updateId?: number): number | null {
+    const raw = message.text ?? message.caption ?? '';
     const text = normalizeMessage(raw);
-    // Preserve the exact first observed version. Edits must not silently change a labeled sample.
-    this.db
-      .prepare(`INSERT INTO messages
-      (chat_id,telegram_message_id,user_id,sender_chat_id,username,raw_text,normalized_text,
-       reduced_text,text_hash,normalizer_version,metadata,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id,telegram_message_id) DO NOTHING`)
-      .run(
-        message.chat.id,
-        message.message_id,
-        message.from?.id ?? null,
-        message.sender_chat?.id ?? null,
-        message.from?.username ?? null,
-        raw,
-        text.normalizedText,
-        text.reducedText,
-        text.textHash,
-        text.normalizerVersion,
-        JSON.stringify({
-          edit_date: message.edit_date ?? null,
-          reply_to_message_id: message.reply_to_message?.message_id ?? null,
-          has_photo: !!message.photo,
-          has_video: !!message.video,
-          has_document: !!message.document,
-          entities: message.entities ?? message.caption_entities ?? [],
-          forward_info: message.forward_origin ?? null,
-        }),
-        message.date * 1000,
-      );
-    const row = this.db
-      .prepare(
-        'SELECT id,raw_text,metadata FROM messages WHERE chat_id=? AND telegram_message_id=?',
-      )
-      .get(message.chat.id, message.message_id);
-    if (
-      row?.raw_text !== raw ||
-      JSON.parse(String(row.metadata)).edit_date !== (message.edit_date ?? null)
-    ) {
-      this.invalidateEdited(message);
-      return null;
-    }
-    return Number(row?.id);
+    const metadata = {
+      edit_date: message.edit_date ?? null,
+      reply_to_message_id: message.reply_to_message?.message_id ?? null,
+      has_photo: !!message.photo,
+      has_video: !!message.video,
+      has_document: !!message.document,
+      entities: message.entities ?? message.caption_entities ?? [],
+      forward_info: message.forward_origin ?? null,
+      media_id:
+        message.photo?.at(-1)?.file_unique_id ??
+        message.video?.file_unique_id ??
+        message.document?.file_unique_id ??
+        null,
+    };
+    return this.transaction(() => {
+      const previous = this.db
+        .prepare('SELECT * FROM messages WHERE chat_id=? AND telegram_message_id=?')
+        .get(message.chat.id, message.message_id);
+      let revision = 0;
+      if (previous) {
+        const old = JSON.parse(String(previous.metadata));
+        const oldDate = Number(old.edit_date ?? message.date),
+          newDate = message.edit_date ?? message.date;
+        if (newDate < oldDate) return null;
+        const same =
+          previous.raw_text === raw &&
+          JSON.stringify(old.entities ?? []) === JSON.stringify(metadata.entities) &&
+          !!old.has_photo === metadata.has_photo &&
+          !!old.has_video === metadata.has_video &&
+          !!old.has_document === metadata.has_document &&
+          (old.media_id === undefined || old.media_id === metadata.media_id);
+        if (newDate === oldDate && same) {
+          if (updateId !== undefined)
+            this.db
+              .prepare(
+                'UPDATE messages SET last_update_id=MAX(COALESCE(last_update_id,?),?) WHERE id=?',
+              )
+              .run(updateId, updateId, Number(previous.id));
+          return raw.trim() ? Number(previous.id) : null;
+        }
+        if (
+          newDate === oldDate &&
+          (updateId === undefined ||
+            previous.last_update_id === null ||
+            updateId <= Number(previous.last_update_id))
+        )
+          return null;
+        // Archive the snapshot, preserving its label/prediction/audit. Only the newest
+        // snapshot retains the unique (chat_id,telegram_message_id) slot.
+        this.db
+          .prepare(
+            "UPDATE moderation_cases SET status='EXPIRED' WHERE message_id=? AND status='PENDING'",
+          )
+          .run(Number(previous.id));
+        this.db
+          .prepare('UPDATE messages SET telegram_message_id=NULL WHERE id=?')
+          .run(Number(previous.id));
+        revision = Number(previous.revision) + 1;
+      } else if (!raw.trim()) return null;
+      const result = this.db
+        .prepare(`INSERT INTO messages
+        (chat_id,telegram_message_id,user_id,sender_chat_id,username,raw_text,normalized_text,
+         reduced_text,text_hash,normalizer_version,metadata,created_at,source_message_id,revision,last_update_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(
+          message.chat.id,
+          message.message_id,
+          message.from?.id ?? null,
+          message.sender_chat?.id ?? null,
+          message.from?.username ?? null,
+          raw,
+          text.normalizedText,
+          text.reducedText,
+          text.textHash,
+          text.normalizerVersion,
+          JSON.stringify(metadata),
+          message.date * 1000,
+          message.message_id,
+          revision,
+          updateId ?? null,
+        );
+      return raw.trim() ? Number(result.lastInsertRowid) : null;
+    });
   }
 
   createCase(messageId: number, now = Date.now(), predictionId: number | null = null): ReviewCase {
+    if (!this.isCurrent(messageId)) throw new Error('Message revision is no longer current');
     this.expire(now);
     this.db
       .prepare(`INSERT INTO moderation_cases(id,message_id,created_at,expires_at,prediction_id)
       VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`)
       .run(randomUUID(), messageId, now, now + 30 * 60_000, predictionId);
     return this.db
-      .prepare(`SELECT c.*,m.chat_id,m.telegram_message_id,m.user_id,m.sender_chat_id,m.raw_text
+      .prepare(`SELECT c.*,m.chat_id,COALESCE(m.telegram_message_id,m.source_message_id) AS telegram_message_id,
+      m.user_id,m.sender_chat_id,m.raw_text,m.revision,m.metadata
       FROM moderation_cases c JOIN messages m ON m.id=c.message_id WHERE c.message_id=?
       ORDER BY c.rowid DESC LIMIT 1`)
       .get(messageId) as unknown as ReviewCase;
@@ -225,7 +289,8 @@ export class SpamStore {
 
   getCase(id: string): ReviewCase | undefined {
     return this.db
-      .prepare(`SELECT c.*,m.chat_id,m.telegram_message_id,m.user_id,m.sender_chat_id,m.raw_text
+      .prepare(`SELECT c.*,m.chat_id,COALESCE(m.telegram_message_id,m.source_message_id) AS telegram_message_id,
+      m.user_id,m.sender_chat_id,m.raw_text,m.revision,m.metadata
       FROM moderation_cases c JOIN messages m ON m.id=c.message_id WHERE c.id=?`)
       .get(id) as unknown as ReviewCase | undefined;
   }
@@ -244,7 +309,8 @@ export class SpamStore {
         verdict === 'spam' ? 'RESOLVED_SPAM' : verdict === 'normal' ? 'RESOLVED_NORMAL' : 'SKIPPED';
       const result = this.db
         .prepare(`UPDATE moderation_cases SET status=?,resolved_by=?,resolved_at=?,
-        deletion_status=? WHERE id=? AND status='PENDING'`)
+        deletion_status=? WHERE id=? AND status='PENDING'
+        AND message_id IN (SELECT id FROM messages WHERE telegram_message_id IS NOT NULL)`)
         .run(status, adminId, now, verdict === 'spam' ? 'PENDING' : 'NOT_REQUESTED', id);
       if (!result.changes) return false;
       if (verdict !== 'skip') {
@@ -343,7 +409,12 @@ export class SpamStore {
 
   dataset(chatId: number) {
     return this.db
-      .prepare('SELECT * FROM training_dataset WHERE chat_id=? ORDER BY text_hash')
+      .prepare(`SELECT d.*, m.raw_text, m.metadata FROM training_dataset d
+        JOIN messages m ON m.id=(SELECT MIN(candidate.id) FROM messages candidate
+          JOIN labels l ON l.message_id=candidate.id
+          WHERE candidate.chat_id=d.chat_id AND candidate.text_hash=d.text_hash
+          AND l.source IN ('ADMIN_CONFIRMED','ADMIN_REJECTED','BOOTSTRAP'))
+        WHERE d.chat_id=? ORDER BY d.text_hash`)
       .all(chatId) as unknown as Sample[];
   }
 
@@ -365,13 +436,6 @@ export class SpamStore {
         "UPDATE moderation_cases SET status='EXPIRED' WHERE status='PENDING' AND expires_at<=?",
       )
       .run(now);
-  }
-
-  invalidateEdited(message: Message) {
-    this.db
-      .prepare(`UPDATE moderation_cases SET status='EXPIRED' WHERE status='PENDING'
-      AND message_id IN (SELECT id FROM messages WHERE chat_id=? AND telegram_message_id=?)`)
-      .run(message.chat.id, message.message_id);
   }
 
   prune(retentionDays: number, now = Date.now()) {

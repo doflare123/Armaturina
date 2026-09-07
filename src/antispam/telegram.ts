@@ -47,16 +47,21 @@ export class SpamTelegram {
     }
   }
 
-  edited(message: Message) {
-    if (this.enabled(message)) this.store.invalidateEdited(message);
+  async edited(message: Message, updateId?: number) {
+    if (!this.enabled(message) || (message.from?.is_bot && !message.sender_chat)) return;
+    const id = this.store.capture(message, updateId);
+    if (id !== null && message.from && !message.from.is_bot && !message.sender_chat) {
+      // An edit is content, never a command. Do not allow a slash prefix to bypass review.
+      await this.suggest(message, id);
+    }
   }
 
-  async message(message: Message, botUsername: string): Promise<boolean> {
+  async message(message: Message, botUsername: string, updateId?: number): Promise<boolean> {
     if (!this.enabled(message)) return false;
     const command = /^\/spam(?:@([a-z0-9_]+))?(?:\s+(.*))?$/iu.exec(message.text ?? '');
     if (!command) {
       if (!message.from?.is_bot || message.sender_chat) {
-        const id = this.store.capture(message);
+        const id = this.store.capture(message, updateId);
         if (
           id !== null &&
           message.from &&
@@ -116,7 +121,10 @@ export class SpamTelegram {
         `Антиспам: LEARNING, модель: ${current?.version ?? 'COLD_START'}. Автоудаление отключено.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}/50\nУникальных normal: ${stats?.normal}/200\nОжидают решения: ${stats?.pending}` +
           (metrics
             ? `\nValidation при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭто экспериментальная оценка; автоматические наказания запрещены.`
-            : '\nДля первого обучения: /spam train'),
+            : '\nДля первого обучения: /spam train') +
+          (current
+            ? `\nПризнаки: ${current.classifier.model.format === 2 ? 'char + word TF-IDF + числовые' : 'только char TF-IDF; обновление: /spam train'}`
+            : ''),
       );
       return true;
     }
@@ -151,11 +159,11 @@ export class SpamTelegram {
       await this.api.sendMessage(message.chat.id, 'Сообщение старше срока хранения.');
       return true;
     }
-    const id = this.store.capture(target);
+    const id = this.store.capture(target, updateId);
     if (id === null) {
       await this.api.sendMessage(
         message.chat.id,
-        'Нужен текст или подпись, совпадающие с сохранённой версией. Изменённое сообщение не размечается.',
+        'Нет текста/подписи или ответ содержит устаревшую версию. Ответьте заново на актуальное сообщение.',
       );
       return true;
     }
@@ -174,7 +182,10 @@ export class SpamTelegram {
   private async suggest(message: Message, messageId: number) {
     const current = this.learning.current(message.chat.id);
     if (!current) return;
-    const score = current.classifier.classify(message.text ?? message.caption ?? '');
+    const score = current.classifier.classify(
+      message.text ?? message.caption ?? '',
+      message.entities ?? message.caption_entities ?? [],
+    );
     let protectedUser = true;
     try {
       const member = await this.api.getChatMember(message.chat.id, message.from?.id ?? 0);
@@ -201,9 +212,16 @@ export class SpamTelegram {
   }
 
   private async sendCard(item: import('./store.ts').ReviewCase, title: string) {
+    const entities = JSON.parse(item.metadata).entities ?? [];
+    const hiddenLinks = entities
+      .filter((entity: { type: string; url?: string }) => entity.type === 'text_link')
+      .map((entity: { url: string }) => entity.url)
+      .join('\n')
+      .slice(0, 600);
     const card = await this.api.sendMessage(
       item.chat_id,
-      `${title} (30 минут).\nID: ${item.id}\n\n${item.raw_text.slice(0, 2800)}`,
+      `${title} (30 минут).\nID: ${item.id}\nВерсия: ${item.revision + 1}\n\n${item.raw_text.slice(0, 2500)}` +
+        (hiddenLinks ? `\n\nСкрытые ссылки:\n${hiddenLinks}` : ''),
       {
         link_preview_options: { is_disabled: true },
         reply_markup: {
@@ -267,7 +285,7 @@ export class SpamTelegram {
     }
     if (!this.store.resolve(id, query.from.id, verdict)) {
       await this.api.answerCallbackQuery(query.id, {
-        text: 'Решение уже принято или проверка истекла.',
+        text: 'Решение уже принято, проверка истекла или сообщение отредактировано.',
       });
       return;
     }

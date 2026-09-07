@@ -1,3 +1,4 @@
+import { type Entity, NUMERIC_FEATURES, scaledNumeric, wordCounts } from './features.ts';
 import { normalizeMessage } from './normalizer.ts';
 
 export interface Sample {
@@ -6,6 +7,8 @@ export interface Sample {
   reduced_text: string;
   label: number;
   duplicate_count?: number;
+  raw_text?: string;
+  metadata?: string;
 }
 export interface Metrics {
   precision: number;
@@ -18,7 +21,10 @@ export interface Metrics {
   fn: number;
 }
 export interface ModelArtifact {
-  format: 1;
+  format: 1 | 2;
+  wordVocabulary?: string[];
+  wordIdf?: number[];
+  numericFeatures?: string[];
   normalizerVersion: 1;
   vocabulary: string[];
   idf: number[];
@@ -49,10 +55,11 @@ export function vectorize(
   text: string,
   vocabulary: ReadonlyMap<string, number>,
   idf: number[],
+  counts = charCounts(text),
 ): SparseVector {
   const vector: SparseVector = [];
   let norm = 0;
-  for (const [term, count] of charCounts(text)) {
+  for (const [term, count] of counts) {
     const index = vocabulary.get(term);
     if (index === undefined) continue;
     const value = (1 + Math.log(count)) * (idf[index] ?? 0);
@@ -61,6 +68,33 @@ export function vectorize(
   }
   norm = Math.sqrt(norm);
   return norm ? vector.map(([i, value]) => [i, value / norm]) : [];
+}
+
+export function combinedVector(
+  text: string,
+  raw: string,
+  entities: readonly Entity[],
+  vocabulary: ReadonlyMap<string, number>,
+  idf: number[],
+  words: ReadonlyMap<string, number>,
+  wordIdf: number[],
+): SparseVector {
+  const char = vectorize(text, vocabulary, idf);
+  const word = vectorize(text, words, wordIdf, wordCounts(text));
+  const numeric = scaledNumeric(raw, entities);
+  return [
+    ...char.map(([i, v]): [number, number] => [i, v / Math.sqrt(3)]),
+    ...word.map(([i, v]): [number, number] => [vocabulary.size + i, v / Math.sqrt(3)]),
+    ...numeric.map((v, i): [number, number] => [
+      vocabulary.size + words.size + i,
+      v / Math.sqrt(3 * numeric.length),
+    ]),
+  ].filter(([, v]) => v !== 0);
+}
+
+export function sampleEntities(sample: Sample): Entity[] {
+  const entities = sample.metadata ? JSON.parse(sample.metadata).entities : [];
+  return Array.isArray(entities) ? entities : [];
 }
 
 export function sigmoid(value: number): number {
@@ -77,7 +111,7 @@ export function probability(vector: SparseVector, weights: ArrayLike<number>, in
 export function validateModel(input: unknown): ModelArtifact {
   const m = input as ModelArtifact;
   if (
-    m?.format !== 1 ||
+    (m?.format !== 1 && m?.format !== 2) ||
     m.normalizerVersion !== 1 ||
     !Array.isArray(m.vocabulary) ||
     m.vocabulary.length < 1 ||
@@ -89,7 +123,9 @@ export function validateModel(input: unknown): ModelArtifact {
     !Array.isArray(m.idf) ||
     !Array.isArray(m.weights) ||
     m.idf.length !== m.vocabulary.length ||
-    m.weights.length !== m.vocabulary.length ||
+    m.weights.length !==
+      m.vocabulary.length +
+        (m.format === 2 ? (m.wordVocabulary?.length ?? 0) + NUMERIC_FEATURES.length : 0) ||
     m.idf.some((v) => !Number.isFinite(v) || v < 1) ||
     m.weights.some((v) => !Number.isFinite(v)) ||
     !Number.isFinite(m.intercept) ||
@@ -122,21 +158,46 @@ export function validateModel(input: unknown): ModelArtifact {
     })
   )
     throw new Error('Invalid model artifact');
+  if (
+    m.format === 2 &&
+    (!Array.isArray(m.wordVocabulary) ||
+      m.wordVocabulary.length > 10000 ||
+      m.wordVocabulary.some((t) => typeof t !== 'string' || !t.length || t.length > 32769) ||
+      new Set(m.wordVocabulary).size !== m.wordVocabulary.length ||
+      !Array.isArray(m.wordIdf) ||
+      m.wordIdf.length !== m.wordVocabulary.length ||
+      m.wordIdf.some((v) => !Number.isFinite(v) || v < 1) ||
+      JSON.stringify(m.numericFeatures) !== JSON.stringify(NUMERIC_FEATURES))
+  )
+    throw new Error('Invalid feature schema');
   return m;
 }
 
 export class SpamClassifier {
   private readonly vocabulary: Map<string, number>;
+  private readonly words: Map<string, number>;
   readonly model: ModelArtifact;
   constructor(input: unknown) {
     this.model = validateModel(input);
     this.vocabulary = new Map(this.model.vocabulary.map((term, i) => [term, i]));
+    this.words = new Map((this.model.wordVocabulary ?? []).map((term, i) => [term, i]));
   }
-  classify(rawText: string): number | null {
+  classify(rawText: string, entities: readonly Entity[] = []): number | null {
     const text = normalizeMessage(rawText).normalizedText;
-    if (text.length > 16_384) return null;
-    const vector = vectorize(text, this.vocabulary, this.model.idf);
-    // Empty/out-of-vocabulary messages are not evidence of either class.
+    if (!text.trim() || rawText.length > 16_384 || text.length > 16_384) return null;
+    const vector =
+      this.model.format === 2
+        ? combinedVector(
+            text,
+            rawText,
+            entities,
+            this.vocabulary,
+            this.model.idf,
+            this.words,
+            this.model.wordIdf ?? [],
+          )
+        : vectorize(text, this.vocabulary, this.model.idf);
+    // Legacy models abstain on OOV; format 2 can still use numeric evidence.
     return vector.length ? probability(vector, this.model.weights, this.model.intercept) : null;
   }
 }

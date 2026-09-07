@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
+import { NUMERIC_FEATURES, wordCounts } from './features.ts';
 import {
   charCounts,
+  combinedVector,
   type Metrics,
   type ModelArtifact,
   probability,
   type Sample,
-  vectorize,
+  sampleEntities,
 } from './model.ts';
 
 export function splitDataset(samples: Sample[]) {
@@ -98,8 +100,33 @@ export function trainModel(samples: Sample[], minSpam = 50, minNormal = 200): Mo
   const idf = vocabulary.map(
     (term) => Math.log((train.length + 1) / ((df.get(term) ?? 0) + 1)) + 1,
   );
-  const vectors = train.map((s) => vectorize(s.normalized_text, index, idf));
-  const weights = new Float64Array(vocabulary.length),
+  const wordDf = new Map<string, number>();
+  for (const s of train)
+    for (const term of wordCounts(s.normalized_text).keys())
+      wordDf.set(term, (wordDf.get(term) ?? 0) + 1);
+  const wordVocabulary = [...wordDf]
+    .filter(([, n]) => n >= 2)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 10000)
+    .map(([term]) => term);
+  const wordIdf = wordVocabulary.map(
+    (term) => Math.log((train.length + 1) / ((wordDf.get(term) ?? 0) + 1)) + 1,
+  );
+  const wordIndex = new Map(wordVocabulary.map((term, i) => [term, i]));
+  const features = (s: Sample) =>
+    combinedVector(
+      s.normalized_text,
+      s.raw_text ?? s.normalized_text,
+      sampleEntities(s),
+      index,
+      idf,
+      wordIndex,
+      wordIdf,
+    );
+  const vectors = train.map(features);
+  const weights = new Float64Array(
+      vocabulary.length + wordVocabulary.length + NUMERIC_FEATURES.length,
+    ),
     gradient = new Float64Array(weights.length);
   const positives = train.filter((s) => s.label === 1).length;
   const classWeights = [
@@ -132,11 +159,14 @@ export function trainModel(samples: Sample[], minSpam = 50, minNormal = 200): Mo
   }
   if (!converged) throw new Error('Training did not converge; previous model retained');
   const scores = validation.map((s) => {
-    const vector = vectorize(s.normalized_text, index, idf);
+    const vector = features(s);
     return vector.length ? probability(vector, weights, intercept) : 0;
   });
   return {
-    format: 1,
+    format: 2,
+    wordVocabulary,
+    wordIdf,
+    numericFeatures: [...NUMERIC_FEATURES],
     normalizerVersion: 1,
     vocabulary,
     idf,

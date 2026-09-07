@@ -89,7 +89,7 @@ test('skip, timeout and observed edits cannot produce training labels', () => {
       if (mode === 'expire')
         assert.equal(db.resolve(item.id, 1, 'spam', 1000 + 30 * 60_000), false);
       if (mode === 'edit') {
-        db.invalidateEdited(msg);
+        db.capture({ ...msg, text: 'changed', edit_date: msg.date + 1 });
         assert.equal(db.resolve(item.id, 1, 'spam', 1001), false);
       }
     }
@@ -124,18 +124,137 @@ test('bootstrap import is validated, transactional, idempotent and chat scoped',
   }
 });
 
-test('review cannot silently substitute an edited text or hidden-link version for the original', () => {
+test('edited snapshots can be reviewed without relabeling the original or accepting stale replies', () => {
   const db = new SpamStore(':memory:');
   try {
-    const id = db.capture(message());
+    const original = message();
+    const id = db.capture(original, 1);
     assert.ok(id);
     const item = db.createCase(id);
-    assert.equal(db.capture({ ...message(), text: 'changed' }), null);
+    const edited = { ...original, text: 'changed', edit_date: original.date + 1 };
+    const next = db.capture(edited, 2);
+    assert.ok(next);
+    assert.notEqual(next, id);
     assert.equal(db.getCase(item.id)?.status, 'EXPIRED');
-    assert.equal(db.capture({ ...message(), edit_date: Math.floor(Date.now() / 1000) }), null);
+    assert.equal(db.resolve(item.id, 1, 'spam'), false);
+    assert.equal(db.capture(original, 1), null);
+    assert.equal(db.capture(edited, 2), next);
     assert.equal(db.dataset(chatId).length, 0);
+    const review = db.createCase(next);
+    assert.equal(review.raw_text, 'changed');
+    assert.equal(review.revision, 1);
+    assert.equal(db.resolve(review.id, 1, 'normal'), true);
+    assert.equal(db.dataset(chatId)[0]?.normalized_text, 'changed');
   } finally {
     db.close();
+  }
+});
+
+test('same-second edits are ordered by update_id; hidden links and caption removal invalidate old cards', () => {
+  const db = new SpamStore(':memory:');
+  try {
+    const base = message(90, 'Ссылка');
+    const first = db.capture(base, 100);
+    assert.ok(first);
+    const card = db.createCase(first);
+    const edit = {
+      ...base,
+      edit_date: base.date + 1,
+      entities: [{ type: 'text_link' as const, offset: 0, length: 6, url: 'https://one.example' }],
+    };
+    const second = db.capture(edit, 101);
+    assert.ok(second);
+    const newer = {
+      ...edit,
+      entities: edit.entities.map((entity) => ({ ...entity, url: 'https://two.example' })),
+    };
+    const third = db.capture(newer, 102);
+    assert.ok(third);
+    assert.notEqual(third, second);
+    assert.equal(db.capture(edit, 101), null);
+    assert.equal(db.capture(newer, 102), third);
+    assert.equal(db.resolve(card.id, 1, 'spam'), false);
+    const current = db.createCase(third);
+    assert.match(current.metadata, /two.example/);
+    assert.equal(db.capture({ ...newer, text: '', edit_date: base.date + 2 }, 103), null);
+    assert.equal(db.resolve(current.id, 1, 'normal'), false);
+    assert.equal(db.capture(newer, 102), null);
+    const restored = db.capture({ ...newer, text: 'Новая подпись', edit_date: base.date + 3 }, 104);
+    assert.ok(restored);
+    assert.notEqual(restored, third);
+  } finally {
+    db.close();
+  }
+});
+
+test('human labels stay attached to historical text after edits and undo does not affect the new version', () => {
+  const db = new SpamStore(':memory:');
+  try {
+    const base = message();
+    const first = db.capture(base);
+    assert.ok(first);
+    const normal = db.createCase(first);
+    assert.equal(db.resolve(normal.id, 1, 'normal'), true);
+    const next = db.capture({ ...base, text: 'Покупайте рекламу', edit_date: base.date + 1 });
+    assert.ok(next);
+    assert.equal(db.dataset(chatId).length, 1);
+    const spam = db.createCase(next);
+    assert.equal(db.resolve(spam.id, 1, 'spam'), true);
+    assert.equal(db.dataset(chatId).length, 2);
+    assert.equal(db.undo(normal.id, 1), true);
+    assert.equal(db.dataset(chatId).length, 1);
+    assert.equal(db.dataset(chatId)[0]?.label, 1);
+    db.prune(1, Date.now() + 2 * 86_400_000);
+    assert.equal(db.getCase(spam.id), undefined);
+    assert.deepEqual(db.dataset(chatId), []);
+  } finally {
+    db.close();
+  }
+});
+
+test('manual review accepts an edited caption first seen by the bot', async () => {
+  const f = fixture();
+  try {
+    const base = message();
+    const edited = {
+      ...base,
+      text: undefined,
+      caption: 'Купить товар',
+      edit_date: base.date + 1,
+    } as Message;
+    await f.adapter.edited(edited, 10);
+    await f.adapter.message(
+      { ...f.command, reply_to_message: { ...edited, reply_to_message: undefined } },
+      'test_bot',
+      11,
+    );
+    assert.match(f.sent[0]?.text ?? '', /Купить товар/);
+    const id = /ID: ([0-9a-f-]+)/.exec(f.sent[0]?.text ?? '')?.[1];
+    assert.ok(id);
+    await f.adapter.callback(f.query(id, 'n'));
+    assert.equal(f.adapter.store.dataset(chatId)[0]?.label, 0);
+    assert.deepEqual(f.deleted, []);
+  } finally {
+    f.adapter.close();
+  }
+});
+
+test('an edit arriving during admin verification prevents the old callback from deleting the new text', async () => {
+  const f = fixture();
+  try {
+    await f.adapter.message(f.command, 'test_bot', 1);
+    const id = /ID: ([0-9a-f-]+)/.exec(f.sent[0]?.text ?? '')?.[1];
+    assert.ok(id);
+    const callback = f.adapter.callback(f.query(id));
+    const base = f.command.reply_to_message;
+    assert.ok(base);
+    await f.adapter.edited({ ...base, text: 'Совсем другой текст', edit_date: base.date + 1 }, 2);
+    await callback;
+    assert.deepEqual(f.deleted, []);
+    assert.deepEqual(f.adapter.store.dataset(chatId), []);
+    assert.equal(f.adapter.store.getCase(id)?.status, 'EXPIRED');
+  } finally {
+    f.adapter.close();
   }
 });
 

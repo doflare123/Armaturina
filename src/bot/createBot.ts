@@ -67,7 +67,8 @@ export function createBot(config: Config): Armaturina {
     bot.on('message', async (ctx) => {
       if (antispam) {
         try {
-          if (await antispam.message(ctx.message, bot.botInfo.username)) return;
+          if (await antispam.message(ctx.message, bot.botInfo.username, ctx.update.update_id))
+            return;
         } catch {
           console.error('antispam_message_failed');
           if (/^\/spam(?:@|\s|$)/i.test(ctx.message.text ?? '')) return;
@@ -82,9 +83,9 @@ export function createBot(config: Config): Armaturina {
         console.error('antispam_callback_failed');
       }
     });
-    bot.on('edited_message', (ctx) => {
+    bot.on('edited_message', async (ctx) => {
       try {
-        antispam?.edited(ctx.editedMessage);
+        await antispam?.edited(ctx.editedMessage, ctx.update.update_id);
       } catch {
         console.error('antispam_edit_failed');
       }
@@ -94,7 +95,9 @@ export function createBot(config: Config): Armaturina {
     });
 
     started = true;
-    runner = run(bot);
+    runner = run(bot, {
+      runner: { fetch: { allowed_updates: ['message', 'edited_message', 'callback_query'] } },
+    });
     runner.task()?.catch((error) => {
       console.error('Armaturina polling stopped with error:', error);
     });

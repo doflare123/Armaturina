@@ -91,7 +91,7 @@ test('logistic regression learns both classes; validation vocabulary never fits 
   assert.ok((classifier.classify('Заработок деньги реклама купи сейчас акция') ?? 0) > 0.6);
   assert.ok((classifier.classify('Обсуждаем проект встреча завтра спасибо друзья') ?? 1) < 0.4);
   assert.equal(classifier.classify(''), null);
-  assert.equal(classifier.classify('🦊🦊🦊'), null);
+  assert.ok(Number.isFinite(classifier.classify('🦊🦊🦊')));
   const train = dataset.filter((s) => model.trainHashes.includes(s.text_hash));
   model.vocabulary.forEach((term, i) => {
     const df = train.filter((s) => charCounts(s.normalized_text).has(term)).length;
@@ -142,16 +142,16 @@ test('schema v1 migration preserves messages and labels and adds constrained pre
   const dir = mkdtempSync(join(tmpdir(), 'spam-migration-')),
     file = join(dir, 'db.sqlite');
   const raw = new DatabaseSync(file);
-  raw.exec(`CREATE TABLE messages(id INTEGER PRIMARY KEY, chat_id INTEGER);
+  raw.exec(`CREATE TABLE messages(id INTEGER PRIMARY KEY, chat_id INTEGER, telegram_message_id INTEGER);
     CREATE TABLE labels(id INTEGER PRIMARY KEY, message_id INTEGER, label INTEGER);
     CREATE TABLE moderation_cases(id TEXT PRIMARY KEY, message_id INTEGER);
-    INSERT INTO messages VALUES(1,-12); INSERT INTO labels VALUES(1,1,0); PRAGMA user_version=1;`);
+    INSERT INTO messages VALUES(1,-12,1); INSERT INTO labels VALUES(1,1,0); PRAGMA user_version=1;`);
   raw.close();
   const store = new SpamStore(file);
   try {
     const inspect = new DatabaseSync(file);
     try {
-      assert.equal(inspect.prepare('PRAGMA user_version').get()?.user_version, 2);
+      assert.equal(inspect.prepare('PRAGMA user_version').get()?.user_version, 3);
       assert.equal(inspect.prepare('SELECT label FROM labels').get()?.label, 0);
       const version = store.activateModel(-12, model, 'snapshot');
       assert.ok(store.prediction(1, version, 0.8, 'ASK_ADMIN', 'test'));
@@ -269,5 +269,93 @@ test('closing the service cancels training without publishing a late model', asy
   } finally {
     learning.close();
     store.close();
+  }
+});
+
+test('a normal message edited into advertising receives a fresh prediction and review', async () => {
+  const sent: string[] = [];
+  const api = {
+    async getChatMember() {
+      return { status: 'member' };
+    },
+    async sendMessage(_chat: number, text: string) {
+      sent.push(text);
+      return { message_id: 500 + sent.length };
+    },
+  } as unknown as Api;
+  const adapter = new SpamTelegram(api, {
+    chatIds: [-12],
+    databasePath: ':memory:',
+    retentionDays: 180,
+  });
+  const msg: Message = {
+    message_id: 1,
+    date: Math.floor(Date.now() / 1000),
+    chat: { id: -12, type: 'supergroup', title: 'test' },
+    from: { id: 10, is_bot: false, first_name: 'user' },
+    text: 'Обсуждаем проект встреча завтра спасибо друзья',
+  };
+  try {
+    adapter.store.activateModel(-12, model, 'snapshot');
+    await adapter.message(msg, 'bot', 100);
+    assert.equal(sent.length, 0);
+    const edit = {
+      ...msg,
+      text: '/hello Заработок деньги реклама купи сейчас акция',
+      edit_date: msg.date + 1,
+    };
+    await adapter.edited(edit, 101);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0] ?? '', /Версия: 2/);
+    await adapter.edited(edit, 101);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(adapter.store.dataset(-12), []);
+  } finally {
+    adapter.close();
+  }
+});
+
+test('v2 migration preserves pending cases, predictions and labels when archiving a revision', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'spam-v2-')),
+    file = join(dir, 'db.sqlite');
+  let store = new SpamStore(file);
+  const msg: Message = {
+    message_id: 1,
+    date: Math.floor(Date.now() / 1000),
+    chat: { id: -12, type: 'supergroup', title: 'test' },
+    text: 'hello',
+  };
+  const first = store.capture(msg);
+  assert.ok(first);
+  const version = store.activateModel(-12, model, 'snapshot');
+  const prediction = store.prediction(first, version, 0.8, 'ASK_ADMIN', 'test');
+  assert.ok(prediction);
+  const review = store.createCase(first, Date.now(), prediction);
+  store.close();
+  const raw = new DatabaseSync(file);
+  raw.exec(`DROP INDEX messages_revisions;
+    ALTER TABLE messages DROP COLUMN source_message_id;
+    ALTER TABLE messages DROP COLUMN revision;
+    ALTER TABLE messages DROP COLUMN last_update_id;
+    PRAGMA user_version=2;`);
+  raw.close();
+  store = new SpamStore(file);
+  try {
+    assert.equal(store.getCase(review.id)?.status, 'PENDING');
+    const next = store.capture({ ...msg, text: 'advertising', edit_date: msg.date + 1 });
+    assert.ok(next);
+    assert.equal(store.getCase(review.id)?.telegram_message_id, 1);
+    assert.equal(store.getCase(review.id)?.status, 'EXPIRED');
+    assert.ok(store.prediction(next, version, 0.9, 'ASK_ADMIN', 'test'));
+    const inspect = new DatabaseSync(file);
+    try {
+      assert.deepEqual(inspect.prepare('PRAGMA foreign_key_check').all(), []);
+      assert.equal(inspect.prepare('SELECT COUNT(*) n FROM predictions').get()?.n, 2);
+    } finally {
+      inspect.close();
+    }
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true });
   }
 });
