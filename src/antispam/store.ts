@@ -20,6 +20,7 @@ export interface ReviewCase {
   expires_at: number;
   revision: number;
   metadata: string;
+  command_message_id: number | null;
 }
 
 /** SQLite owns arbitration; no network request is made inside a transaction. */
@@ -32,17 +33,28 @@ export class SpamStore {
     try {
       this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;');
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version;
-      if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4)
+      if (
+        version !== 0 &&
+        version !== 1 &&
+        version !== 2 &&
+        version !== 3 &&
+        version !== 4 &&
+        version !== 5
+      )
         throw new Error('Unsupported antispam schema version');
       if (version === 0) this.migrate();
       if (version === 0 || version === 1) this.migrateModels();
       if (version === 0 || version === 1 || version === 2) this.migrateRevisions();
-      if (version !== 4)
+      if (version !== 4 && version !== 5)
         this.db.exec(`BEGIN IMMEDIATE;
         ALTER TABLE predictions ADD COLUMN markov_score REAL CHECK(markov_score BETWEEN 0 AND 1);
         ALTER TABLE predictions ADD COLUMN final_score REAL CHECK(final_score BETWEEN 0 AND 1);
         UPDATE predictions SET final_score=classifier_score;
         PRAGMA user_version=4; COMMIT;`);
+      if (version !== 5)
+        this.db.exec(`BEGIN IMMEDIATE;
+        ALTER TABLE moderation_cases ADD COLUMN command_message_id INTEGER;
+        PRAGMA user_version=5; COMMIT;`);
     } catch (error) {
       this.db.close();
       throw error;
@@ -313,10 +325,12 @@ export class SpamStore {
       .get(id) as unknown as ReviewCase | undefined;
   }
 
-  bindCard(id: string, cardId: number) {
+  bindCard(id: string, cardId: number, commandMessageId: number | null = null) {
     this.db
-      .prepare('UPDATE moderation_cases SET card_id=? WHERE id=? AND card_id IS NULL')
-      .run(cardId, id);
+      .prepare(
+        'UPDATE moderation_cases SET card_id=?,command_message_id=? WHERE id=? AND card_id IS NULL',
+      )
+      .run(cardId, commandMessageId, id);
   }
 
   resolve(id: string, adminId: number, verdict: Verdict, now = Date.now()): boolean {

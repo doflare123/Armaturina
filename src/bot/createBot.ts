@@ -8,6 +8,7 @@ import { FileStore } from '../store/fileStore.ts';
 import type { Config } from '../types.ts';
 import type { BotDeps } from './deps.ts';
 import { handleMessage } from './dispatch.ts';
+import { isTechnicalCommand, TechnicalCleanup, withTechnicalCleanup } from './technicalCleanup.ts';
 
 export interface Armaturina {
   start(): Promise<void>;
@@ -28,6 +29,7 @@ export function createBot(config: Config): Armaturina {
   let started = false;
   let runner: RunnerHandle | null = null;
   let antispam: SpamTelegram | undefined;
+  let cleanup: TechnicalCleanup | undefined;
 
   const deps: BotDeps = {
     api: bot.api,
@@ -49,6 +51,7 @@ export function createBot(config: Config): Armaturina {
     await store.load();
     await bot.init();
     botInfo = bot.botInfo;
+    cleanup = new TechnicalCleanup(bot.api);
     if (config.antispam) {
       const { SpamTelegram } = await import('../antispam/telegram.ts');
       antispam = new SpamTelegram(bot.api, config.antispam);
@@ -74,7 +77,13 @@ export function createBot(config: Config): Armaturina {
           if (/^\/spam(?:@|\s|$)/i.test(ctx.message.text ?? '')) return;
         }
       }
-      await handleMessage(deps, ctx.message);
+      if (cleanup && isTechnicalCommand(ctx.message, bot.botInfo.username)) {
+        await withTechnicalCleanup(bot.api, cleanup, ctx.message, (api) =>
+          handleMessage({ ...deps, api }, ctx.message),
+        );
+      } else {
+        await handleMessage(deps, ctx.message);
+      }
     });
     bot.on('callback_query:data', async (ctx) => {
       try {
@@ -113,6 +122,8 @@ export function createBot(config: Config): Armaturina {
     await runner.stop();
     antispam?.close();
     antispam = undefined;
+    cleanup?.close();
+    cleanup = undefined;
     started = false;
   }
 

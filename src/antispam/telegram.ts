@@ -1,5 +1,6 @@
 import type { Api } from 'grammy';
 import type { CallbackQuery, Message } from 'grammy/types';
+import { TechnicalCleanup } from '../bot/technicalCleanup.ts';
 import type { SpamConfig } from './config.ts';
 import { decide } from './decision.ts';
 import { LearningService } from './learning.ts';
@@ -13,9 +14,11 @@ export class SpamTelegram {
   readonly learning: LearningService;
   private closed = false;
   private readonly timer: ReturnType<typeof setInterval>;
+  private readonly cleanup: TechnicalCleanup;
 
   constructor(api: Api, config: SpamConfig) {
     this.api = api;
+    this.cleanup = new TechnicalCleanup(api);
     this.config = config;
     this.store = new SpamStore(config.databasePath);
     this.store.prune(config.retentionDays);
@@ -80,13 +83,11 @@ export class SpamTelegram {
       !message.from ||
       !(await this.isAdmin(message.chat.id, message.from.id))
     ) {
-      await this.api.sendMessage(
-        message.chat.id,
-        'Разметка доступна администратору от личного аккаунта.',
-      );
+      await this.reply(message, 'Разметка доступна администратору от личного аккаунта.');
       return true;
     }
-    const arg = command[2]?.trim() ?? 'status';
+    const input = command[2]?.trim() ?? 'status';
+    const arg = input === 'rewiev' ? 'review' : input;
     if (arg === 'train') {
       // Do not hold the per-chat update queue while CPU work runs in another thread.
       const task = this.learning.train(message.chat.id);
@@ -94,17 +95,13 @@ export class SpamTelegram {
         .then(
           async (version) => {
             if (!this.closed)
-              await this.api.sendMessage(
-                message.chat.id,
+              await this.reply(
+                message,
                 `Модель ${version} обучена. Включены только предложения, автоудаление отключено.`,
               );
           },
           async (error: Error) => {
-            if (!this.closed)
-              await this.api.sendMessage(
-                message.chat.id,
-                `Обучение не завершено: ${error.message}`,
-              );
+            if (!this.closed) await this.reply(message, `Обучение не завершено: ${error.message}`);
           },
         )
         .catch(() => {
@@ -116,8 +113,8 @@ export class SpamTelegram {
       const stats = this.store.stats(message.chat.id);
       const current = this.learning.current(message.chat.id);
       const metrics = current?.classifier.model.metrics;
-      await this.api.sendMessage(
-        message.chat.id,
+      await this.reply(
+        message,
         `Антиспам: LEARNING, модель: ${current?.version ?? 'COLD_START'}. Автоудаление отключено.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}/50\nУникальных normal: ${stats?.normal}/200\nОжидают решения: ${stats?.pending}` +
           (metrics
             ? `\nValidation при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭто экспериментальная оценка; автоматические наказания запрещены.`
@@ -132,8 +129,8 @@ export class SpamTelegram {
       const id = arg.slice(5).trim();
       const item = this.store.getCase(id);
       const done = item?.chat_id === message.chat.id && this.store.undo(id, message.from.id);
-      await this.api.sendMessage(
-        message.chat.id,
+      await this.reply(
+        message,
         done
           ? 'Разметка отменена. Удалённое сообщение восстановить нельзя.'
           : 'Решение не найдено или уже отменено.',
@@ -141,42 +138,51 @@ export class SpamTelegram {
       return true;
     }
     if (arg !== 'review' || !message.reply_to_message) {
-      await this.api.sendMessage(
-        message.chat.id,
+      await this.reply(
+        message,
         '/spam review — ответом на сообщение для разметки.\n/spam train\n/spam status\n/spam stats\n/spam undo <id решения>',
       );
       return true;
     }
     const target = message.reply_to_message;
     if (target.chat.id !== message.chat.id || target.from?.is_bot || target.sender_chat) {
-      await this.api.sendMessage(
-        message.chat.id,
-        'Для проверки нужно сообщение пользователя этой группы.',
-      );
+      await this.reply(message, 'Для проверки нужно сообщение пользователя этой группы.');
       return true;
     }
     if (target.date * 1000 < Date.now() - this.config.retentionDays * 86_400_000) {
-      await this.api.sendMessage(message.chat.id, 'Сообщение старше срока хранения.');
+      await this.reply(message, 'Сообщение старше срока хранения.');
       return true;
     }
     const id = this.store.capture(target, updateId);
     if (id === null) {
-      await this.api.sendMessage(
-        message.chat.id,
+      await this.reply(
+        message,
         'Нет текста/подписи или ответ содержит устаревшую версию. Ответьте заново на актуальное сообщение.',
       );
       return true;
     }
     const item = this.store.createCase(id);
     if (item.card_id !== null || item.status !== 'PENDING') {
-      await this.api.sendMessage(
-        message.chat.id,
-        `Проверка уже существует: ${item.status}. ID: ${item.id}`,
-      );
+      await this.reply(message, `Проверка уже существует: ${item.status}. ID: ${item.id}`);
       return true;
     }
-    await this.sendCard(item, 'Ручная разметка');
+    try {
+      await this.sendCard(item, 'Ручная разметка', message.message_id);
+    } catch (error) {
+      this.cleanup.schedule(message.chat.id, message.message_id);
+      throw error;
+    }
     return true;
+  }
+
+  private async reply(message: Message, text: string) {
+    try {
+      const response = await this.api.sendMessage(message.chat.id, text);
+      this.cleanup.schedule(message.chat.id, response?.message_id);
+      return response;
+    } finally {
+      this.cleanup.schedule(message.chat.id, message.message_id);
+    }
   }
 
   private async suggest(message: Message, messageId: number) {
@@ -214,7 +220,11 @@ export class SpamTelegram {
     );
   }
 
-  private async sendCard(item: import('./store.ts').ReviewCase, title: string) {
+  private async sendCard(
+    item: import('./store.ts').ReviewCase,
+    title: string,
+    commandMessageId: number | null = null,
+  ) {
     const entities = JSON.parse(item.metadata).entities ?? [];
     const hiddenLinks = entities
       .filter((entity: { type: string; url?: string }) => entity.type === 'text_link')
@@ -238,7 +248,7 @@ export class SpamTelegram {
         },
       },
     );
-    this.store.bindCard(item.id, card.message_id);
+    this.store.bindCard(item.id, card.message_id, commandMessageId);
   }
 
   async callback(query: CallbackQuery): Promise<void> {
@@ -290,6 +300,8 @@ export class SpamTelegram {
       await this.api.answerCallbackQuery(query.id, {
         text: 'Решение уже принято, проверка истекла или сообщение отредактировано.',
       });
+      if (this.store.getCase(id)?.status !== 'PENDING')
+        this.cleanup.schedule(item.chat_id, card.message_id, item.command_message_id);
       return;
     }
     let deletion = '';
@@ -317,11 +329,13 @@ export class SpamTelegram {
       .catch(() => {
         console.error('antispam_card_update_failed');
       });
+    this.cleanup.schedule(item.chat_id, card.message_id, item.command_message_id);
   }
 
   close() {
     this.closed = true;
     clearInterval(this.timer);
+    this.cleanup.close();
     this.learning.close();
     this.store.close();
   }

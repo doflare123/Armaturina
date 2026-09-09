@@ -151,7 +151,7 @@ test('schema v1 migration preserves messages and labels and adds constrained pre
   try {
     const inspect = new DatabaseSync(file);
     try {
-      assert.equal(inspect.prepare('PRAGMA user_version').get()?.user_version, 4);
+      assert.equal(inspect.prepare('PRAGMA user_version').get()?.user_version, 5);
       assert.equal(inspect.prepare('SELECT label FROM labels').get()?.label, 0);
       const version = store.activateModel(-12, model, 'snapshot');
       assert.ok(store.prediction(1, version, 0.8, 'ASK_ADMIN', 'test', 0.7, 0.79));
@@ -345,6 +345,7 @@ test('v2 migration preserves pending cases, predictions and labels when archivin
     ALTER TABLE messages DROP COLUMN last_update_id;
     ALTER TABLE predictions DROP COLUMN markov_score;
     ALTER TABLE predictions DROP COLUMN final_score;
+    ALTER TABLE moderation_cases DROP COLUMN command_message_id;
     PRAGMA user_version=2;`);
   raw.close();
   store = new SpamStore(file);
