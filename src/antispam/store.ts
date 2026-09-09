@@ -32,11 +32,17 @@ export class SpamStore {
     try {
       this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;');
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version;
-      if (version !== 0 && version !== 1 && version !== 2 && version !== 3)
+      if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4)
         throw new Error('Unsupported antispam schema version');
       if (version === 0) this.migrate();
       if (version === 0 || version === 1) this.migrateModels();
       if (version === 0 || version === 1 || version === 2) this.migrateRevisions();
+      if (version !== 4)
+        this.db.exec(`BEGIN IMMEDIATE;
+        ALTER TABLE predictions ADD COLUMN markov_score REAL CHECK(markov_score BETWEEN 0 AND 1);
+        ALTER TABLE predictions ADD COLUMN final_score REAL CHECK(final_score BETWEEN 0 AND 1);
+        UPDATE predictions SET final_score=classifier_score;
+        PRAGMA user_version=4; COMMIT;`);
     } catch (error) {
       this.db.close();
       throw error;
@@ -164,13 +170,25 @@ export class SpamStore {
     score: number | null,
     decision: string,
     reason: string,
+    markovScore: number | null = null,
+    finalScore: number | null = score,
   ): number | null {
     const inserted = this.db
-      .prepare(`INSERT INTO predictions(message_id,model_version,classifier_score,decision,reason,created_at)
-      SELECT id,?,?,?,?,? FROM messages WHERE id=? AND telegram_message_id IS NOT NULL
+      .prepare(`INSERT INTO predictions(message_id,model_version,classifier_score,decision,reason,created_at,markov_score,final_score)
+      SELECT id,?,?,?,?,?,?,? FROM messages WHERE id=? AND telegram_message_id IS NOT NULL
       AND chat_id=(SELECT chat_id FROM model_versions WHERE version=?)
       ON CONFLICT(message_id) DO NOTHING`)
-      .run(version, score, decision, reason, Date.now(), messageId, version);
+      .run(
+        version,
+        score,
+        decision,
+        reason,
+        Date.now(),
+        markovScore,
+        finalScore,
+        messageId,
+        version,
+      );
     return inserted.changes ? Number(inserted.lastInsertRowid) : null;
   }
 

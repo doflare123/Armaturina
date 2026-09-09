@@ -123,7 +123,7 @@ export class SpamTelegram {
             ? `\nValidation при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭто экспериментальная оценка; автоматические наказания запрещены.`
             : '\nДля первого обучения: /spam train') +
           (current
-            ? `\nПризнаки: ${current.classifier.model.format === 2 ? 'char + word TF-IDF + числовые' : 'только char TF-IDF; обновление: /spam train'}`
+            ? `\nПризнаки: ${current.classifier.model.format === 3 ? 'char + word TF-IDF + числовые + Markov' : current.classifier.model.format === 2 ? 'char + word TF-IDF + числовые; Markov: /spam train' : 'только char TF-IDF; обновление: /spam train'}`
             : ''),
       );
       return true;
@@ -182,7 +182,7 @@ export class SpamTelegram {
   private async suggest(message: Message, messageId: number) {
     const current = this.learning.current(message.chat.id);
     if (!current) return;
-    const score = current.classifier.classify(
+    const assessment = current.classifier.assess(
       message.text ?? message.caption ?? '',
       message.entities ?? message.caption_entities ?? [],
     );
@@ -193,21 +193,24 @@ export class SpamTelegram {
     } catch {
       /* Unknown permissions suppress suggestions. */
     }
+    const score = assessment.finalScore;
     const result = decide(score, protectedUser);
     const limited = result.decision === 'ASK_ADMIN' && !this.store.canPropose(message.chat.id);
     const predictionId = this.store.prediction(
       messageId,
       current.version,
-      score,
+      assessment.classifierScore,
       result.decision,
       limited ? 'review_rate_limited' : result.reason,
+      assessment.markovScore,
+      score,
     );
     if (predictionId === null || limited || result.decision !== 'ASK_ADMIN') return;
     const item = this.store.createCase(messageId, Date.now(), predictionId);
     if (item.card_id !== null || item.status !== 'PENDING') return;
     await this.sendCard(
       item,
-      `Возможный спам — нужна проверка администратора.\nОценка модели: ${((score ?? 0) * 100).toFixed(1)}% (не гарантия).\nМодель: ${current.version}`,
+      `Возможный спам — нужна проверка администратора.\nИтог: ${((score ?? 0) * 100).toFixed(1)}% (не гарантия).\nКлассификатор: ${((assessment.classifierScore ?? 0) * 100).toFixed(1)}%\nMarkov: ${assessment.markovScore === null ? 'нет оценки' : `${(assessment.markovScore * 100).toFixed(1)}%`}\nМодель: ${current.version}`,
     );
   }
 

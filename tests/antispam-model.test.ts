@@ -151,10 +151,16 @@ test('schema v1 migration preserves messages and labels and adds constrained pre
   try {
     const inspect = new DatabaseSync(file);
     try {
-      assert.equal(inspect.prepare('PRAGMA user_version').get()?.user_version, 3);
+      assert.equal(inspect.prepare('PRAGMA user_version').get()?.user_version, 4);
       assert.equal(inspect.prepare('SELECT label FROM labels').get()?.label, 0);
       const version = store.activateModel(-12, model, 'snapshot');
-      assert.ok(store.prediction(1, version, 0.8, 'ASK_ADMIN', 'test'));
+      assert.ok(store.prediction(1, version, 0.8, 'ASK_ADMIN', 'test', 0.7, 0.79));
+      const scores = inspect
+        .prepare('SELECT classifier_score,markov_score,final_score FROM predictions')
+        .get();
+      assert.equal(scores?.classifier_score, 0.8);
+      assert.equal(scores?.markov_score, 0.7);
+      assert.equal(scores?.final_score, 0.79);
       assert.equal(store.prediction(1, version, 0.8, 'ASK_ADMIN', 'test'), null);
       assert.throws(() => inspect.prepare("UPDATE predictions SET decision='AUTO_DELETE'").run());
       assert.throws(() => inspect.prepare('UPDATE predictions SET classifier_score=2').run());
@@ -337,6 +343,8 @@ test('v2 migration preserves pending cases, predictions and labels when archivin
     ALTER TABLE messages DROP COLUMN source_message_id;
     ALTER TABLE messages DROP COLUMN revision;
     ALTER TABLE messages DROP COLUMN last_update_id;
+    ALTER TABLE predictions DROP COLUMN markov_score;
+    ALTER TABLE predictions DROP COLUMN final_score;
     PRAGMA user_version=2;`);
   raw.close();
   store = new SpamStore(file);
@@ -351,6 +359,11 @@ test('v2 migration preserves pending cases, predictions and labels when archivin
     try {
       assert.deepEqual(inspect.prepare('PRAGMA foreign_key_check').all(), []);
       assert.equal(inspect.prepare('SELECT COUNT(*) n FROM predictions').get()?.n, 2);
+      const old = inspect
+        .prepare('SELECT markov_score,final_score FROM predictions WHERE id=?')
+        .get(prediction);
+      assert.equal(old?.markov_score, null);
+      assert.equal(old?.final_score, 0.8);
     } finally {
       inspect.close();
     }

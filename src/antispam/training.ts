@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { NUMERIC_FEATURES, wordCounts } from './features.ts';
+import { combineScores, MarkovSignal, trainMarkov } from './markov.ts';
 import {
   charCounts,
   combinedVector,
@@ -158,12 +159,20 @@ export function trainModel(samples: Sample[], minSpam = 50, minNormal = 200): Mo
     }
   }
   if (!converged) throw new Error('Training did not converge; previous model retained');
+  const markov = trainMarkov(train);
+  const signal = new MarkovSignal(markov);
   const scores = validation.map((s) => {
     const vector = features(s);
-    return vector.length ? probability(vector, weights, intercept) : 0;
+    return (
+      combineScores(
+        vector.length ? probability(vector, weights, intercept) : null,
+        signal.score(s.normalized_text),
+      ) ?? 0
+    );
   });
   return {
-    format: 2,
+    format: 3,
+    markov,
     wordVocabulary,
     wordIdf,
     numericFeatures: [...NUMERIC_FEATURES],

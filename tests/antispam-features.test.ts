@@ -79,7 +79,7 @@ test('visible URL entities deduplicate while hidden URLs and mentions use UTF-16
 });
 
 test('word vocabulary/IDF fits train only; combined vectors are bounded and shared by inference', () => {
-  assert.equal(model.format, 2);
+  assert.equal(model.format, 3);
   const train = samples.filter((s) => model.trainHashes.includes(s.text_hash));
   model.wordVocabulary?.forEach((term, i) => {
     const df = train.filter((s) => wordCounts(s.normalized_text).has(term)).length;

@@ -1,4 +1,5 @@
 import { type Entity, NUMERIC_FEATURES, scaledNumeric, wordCounts } from './features.ts';
+import { combineScores, type MarkovArtifact, MarkovSignal, validateMarkov } from './markov.ts';
 import { normalizeMessage } from './normalizer.ts';
 
 export interface Sample {
@@ -21,7 +22,8 @@ export interface Metrics {
   fn: number;
 }
 export interface ModelArtifact {
-  format: 1 | 2;
+  format: 1 | 2 | 3;
+  markov?: MarkovArtifact;
   wordVocabulary?: string[];
   wordIdf?: number[];
   numericFeatures?: string[];
@@ -111,7 +113,7 @@ export function probability(vector: SparseVector, weights: ArrayLike<number>, in
 export function validateModel(input: unknown): ModelArtifact {
   const m = input as ModelArtifact;
   if (
-    (m?.format !== 1 && m?.format !== 2) ||
+    (m?.format !== 1 && m?.format !== 2 && m?.format !== 3) ||
     m.normalizerVersion !== 1 ||
     !Array.isArray(m.vocabulary) ||
     m.vocabulary.length < 1 ||
@@ -125,7 +127,7 @@ export function validateModel(input: unknown): ModelArtifact {
     m.idf.length !== m.vocabulary.length ||
     m.weights.length !==
       m.vocabulary.length +
-        (m.format === 2 ? (m.wordVocabulary?.length ?? 0) + NUMERIC_FEATURES.length : 0) ||
+        (m.format !== 1 ? (m.wordVocabulary?.length ?? 0) + NUMERIC_FEATURES.length : 0) ||
     m.idf.some((v) => !Number.isFinite(v) || v < 1) ||
     m.weights.some((v) => !Number.isFinite(v)) ||
     !Number.isFinite(m.intercept) ||
@@ -159,7 +161,7 @@ export function validateModel(input: unknown): ModelArtifact {
   )
     throw new Error('Invalid model artifact');
   if (
-    m.format === 2 &&
+    m.format !== 1 &&
     (!Array.isArray(m.wordVocabulary) ||
       m.wordVocabulary.length > 10000 ||
       m.wordVocabulary.some((t) => typeof t !== 'string' || !t.length || t.length > 32769) ||
@@ -170,23 +172,26 @@ export function validateModel(input: unknown): ModelArtifact {
       JSON.stringify(m.numericFeatures) !== JSON.stringify(NUMERIC_FEATURES))
   )
     throw new Error('Invalid feature schema');
+  if (m.format === 3) validateMarkov(m.markov);
   return m;
 }
 
 export class SpamClassifier {
   private readonly vocabulary: Map<string, number>;
   private readonly words: Map<string, number>;
+  private readonly markov: MarkovSignal | null;
   readonly model: ModelArtifact;
   constructor(input: unknown) {
     this.model = validateModel(input);
     this.vocabulary = new Map(this.model.vocabulary.map((term, i) => [term, i]));
     this.words = new Map((this.model.wordVocabulary ?? []).map((term, i) => [term, i]));
+    this.markov = this.model.format === 3 ? new MarkovSignal(this.model.markov) : null;
   }
   classify(rawText: string, entities: readonly Entity[] = []): number | null {
     const text = normalizeMessage(rawText).normalizedText;
     if (!text.trim() || rawText.length > 16_384 || text.length > 16_384) return null;
     const vector =
-      this.model.format === 2
+      this.model.format !== 1
         ? combinedVector(
             text,
             rawText,
@@ -199,5 +204,18 @@ export class SpamClassifier {
         : vectorize(text, this.vocabulary, this.model.idf);
     // Legacy models abstain on OOV; format 2 can still use numeric evidence.
     return vector.length ? probability(vector, this.model.weights, this.model.intercept) : null;
+  }
+
+  assess(rawText: string, entities: readonly Entity[] = []) {
+    const classifierScore = this.classify(rawText, entities);
+    const markovScore =
+      classifierScore === null
+        ? null
+        : (this.markov?.score(normalizeMessage(rawText).normalizedText) ?? null);
+    return {
+      classifierScore,
+      markovScore,
+      finalScore: combineScores(classifierScore, markovScore),
+    };
   }
 }
