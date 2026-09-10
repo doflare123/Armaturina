@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { ActiveSafety } from './active.ts';
 
-export type SpamMode = 'LEARNING' | 'SHADOW';
+export type SpamMode = 'LEARNING' | 'SHADOW' | 'ACTIVE';
 export interface PredictionPolicy {
   mode: SpamMode;
   threshold: number;
@@ -94,8 +95,10 @@ export function calibrate(rows: EvaluationRow[]) {
 /** Runtime policy is separate from immutable learned model artifacts. */
 export class SpamGovernance {
   private readonly db: DatabaseSync;
+  readonly active: ActiveSafety;
   constructor(db: DatabaseSync) {
     this.db = db;
+    this.active = new ActiveSafety(db);
   }
   static migrate(db: DatabaseSync) {
     db.exec(`BEGIN IMMEDIATE;
@@ -113,8 +116,10 @@ export class SpamGovernance {
   }
   policy(chatId: number, version: string): PredictionPolicy {
     return {
-      mode: (this.db.prepare('SELECT mode FROM spam_modes WHERE chat_id=?').get(chatId)?.mode ??
-        'LEARNING') as SpamMode,
+      mode: this.active.grant(chatId, version)
+        ? 'ACTIVE'
+        : ((this.db.prepare('SELECT mode FROM spam_modes WHERE chat_id=?').get(chatId)?.mode ??
+            'LEARNING') as SpamMode),
       threshold: Number(
         this.db.prepare('SELECT threshold FROM model_thresholds WHERE version=?').get(version)
           ?.threshold ?? 0.6,
@@ -136,6 +141,7 @@ export class SpamGovernance {
   setMode(chatId: number, mode: SpamMode, adminId: number) {
     if (mode !== 'SHADOW' && mode !== 'LEARNING') throw new Error('Режим: SHADOW или LEARNING.');
     this.change(() => {
+      this.active.revoke(chatId, 'mode_changed');
       this.db
         .prepare(
           'INSERT INTO spam_modes VALUES (?,?) ON CONFLICT(chat_id) DO UPDATE SET mode=excluded.mode',
@@ -159,6 +165,7 @@ export class SpamGovernance {
           'INSERT INTO model_thresholds VALUES (?,?) ON CONFLICT(version) DO UPDATE SET threshold=excluded.threshold',
         )
         .run(version, threshold);
+      this.active.revoke(chatId, 'threshold_changed');
       this.audit(chatId, adminId, 'threshold', { version, threshold });
     });
   }

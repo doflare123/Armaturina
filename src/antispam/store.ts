@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Message } from 'grammy/types';
+import { ActiveSafety } from './active.ts';
 import { type PredictionPolicy, SpamGovernance } from './governance.ts';
 import { type ModelArtifact, type Sample, validateModel } from './model.ts';
 import { normalizeMessage } from './normalizer.ts';
@@ -43,7 +44,8 @@ export class SpamStore {
         version !== 4 &&
         version !== 5 &&
         version !== 6 &&
-        version !== 7
+        version !== 7 &&
+        version !== 8
       )
         throw new Error('Unsupported antispam schema version');
       if (version === 0) this.migrate();
@@ -76,6 +78,7 @@ export class SpamStore {
           policy_version INTEGER NOT NULL, signals_json TEXT NOT NULL);
         PRAGMA user_version=6; COMMIT;`);
       if (Number(version) < 7) SpamGovernance.migrate(this.db);
+      if (Number(version) < 8) ActiveSafety.migrate(this.db);
       this.governance = new SpamGovernance(this.db);
     } catch (error) {
       this.db.close();
@@ -184,6 +187,7 @@ export class SpamStore {
     const version = randomUUID();
     this.transaction(() => {
       const previous = this.activeModel(chatId)?.version ?? null;
+      this.governance.active.revoke(chatId, 'model_trained');
       this.db.prepare('UPDATE model_versions SET active=0 WHERE chat_id=?').run(chatId);
       this.db
         .prepare('INSERT INTO model_versions VALUES (?,?,?,?,?,?,1)')
@@ -231,6 +235,7 @@ export class SpamStore {
       validateModel(JSON.parse(String(row.artifact_json)));
       const previous = this.activeModel(chatId)?.version ?? null;
       if (previous === version) throw new Error('Эта версия уже активна.');
+      this.governance.active.revoke(chatId, 'rollback');
       this.db.prepare('UPDATE model_versions SET active=0 WHERE chat_id=?').run(chatId);
       this.db
         .prepare('UPDATE model_versions SET active=1 WHERE chat_id=? AND version=?')
@@ -270,6 +275,7 @@ export class SpamStore {
       const id = inserted.changes ? Number(inserted.lastInsertRowid) : null;
       if (id !== null && signals) this.saveSignals(id, signals);
       if (id !== null && policy) this.governance.record(id, policy);
+      if (id !== null && policy && signals) this.governance.active.enroll(id);
       return id;
     });
   }
@@ -434,6 +440,10 @@ export class SpamStore {
       this.db
         .prepare('INSERT INTO feedback_audit(case_id,admin_id,verdict,created_at) VALUES (?,?,?,?)')
         .run(id, adminId, verdict, now);
+      if (verdict === 'normal') {
+        const item = this.getCase(id);
+        if (item) this.governance.active.feedback(item.message_id);
+      }
       return true;
     });
   }
@@ -453,6 +463,8 @@ export class SpamStore {
       this.db
         .prepare('INSERT INTO feedback_audit(case_id,admin_id,verdict,created_at) VALUES (?,?,?,?)')
         .run(id, adminId, 'undo', now);
+      const item = this.getCase(id);
+      if (item) this.governance.active.feedbackChanged(item.message_id);
       return true;
     });
   }

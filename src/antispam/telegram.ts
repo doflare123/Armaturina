@@ -2,7 +2,7 @@ import type { Api } from 'grammy';
 import type { CallbackQuery, Message } from 'grammy/types';
 import { TechnicalCleanup } from '../bot/technicalCleanup.ts';
 import type { SpamConfig } from './config.ts';
-import { decide } from './decision.ts';
+import { activeAction, decide } from './decision.ts';
 import { calibrate, evaluationGroups, quality } from './governance.ts';
 import { LearningService } from './learning.ts';
 import type { SpamClassifier } from './model.ts';
@@ -14,7 +14,7 @@ function formatQuality(metrics: ReturnType<typeof quality>): string {
   return `TP/FP/TN/FN ${metrics.tp}/${metrics.fp}/${metrics.tn}/${metrics.fn}; precision ${pct(metrics.precision)}, recall ${pct(metrics.recall)}, F1 ${pct(metrics.f1)}, FPR ${pct(metrics.falsePositiveRate)}`;
 }
 
-/** LEARNING adapter: local model suggestions, human feedback, no automatic punishment. */
+/** Local inference, human feedback and explicitly approved ACTIVE message deletion. */
 export class SpamTelegram {
   private readonly api: Api;
   private readonly config: SpamConfig;
@@ -98,6 +98,81 @@ export class SpamTelegram {
     }
     const input = command[2]?.trim() ?? 'status';
     const arg = input === 'rewiev' ? 'review' : input;
+    if (arg.startsWith('active')) {
+      try {
+        const [, action, id, extra] = arg.split(/\s+/);
+        if (action === 'log' && !id) {
+          const entries = this.store.governance.active.log(message.chat.id);
+          await this.reply(
+            message,
+            `${entries
+              .map(
+                (e) =>
+                  `${e.prediction_id}: ${e.status} · ${new Date(e.created_at).toISOString()}\n${e.raw_text.slice(0, 150)}`,
+              )
+              .join('\n')}\nПроверить удаление: /spam active review <номер прогноза>`,
+          );
+          return true;
+        }
+        if (!id || extra)
+          throw new Error(
+            '/spam active prepare <version>\n/spam active sample <id>\n/spam active check <id>\n/spam active enable <id>',
+          );
+        const safety = this.store.governance.active;
+        if (action === 'prepare') {
+          const evaluationId = safety.prepare(message.chat.id, id, message.from.id);
+          await this.reply(
+            message,
+            `Проверка ${evaluationId} начата в SHADOW. Собираются следующие 1000 уникальных пригодных прогнозов без отбора по score.\nРазметка: /spam active sample ${evaluationId}\nПроверка precision/FPR: /spam active check ${evaluationId}`,
+          );
+        } else if (action === 'check') {
+          const result = safety.check(message.chat.id, id, message.from.id);
+          await this.reply(
+            message,
+            `Допуск ${id}: ${result.passed ? 'ПРОЙДЕН' : 'НЕ ПРОЙДЕН'}. Выборка ${result.samples}/1000, размечено ${result.labelled}.\n${formatQuality(result.metrics)}\nТребуется precision ≥99%, FPR ≤1%, ≥100 положительных прогнозов, ≥400 normal и все 1000 меток.\n${result.passed ? `Ручное включение удаления сообщений: /spam active enable ${id}` : 'ACTIVE отключён до успешной проверки.'}`,
+          );
+        } else if (action === 'enable') {
+          if (!(await this.canDelete(message.chat.id)))
+            throw new Error('Не удалось проверить право бота на удаление сообщений.');
+          // Admin status is checked again after the additional Telegram request.
+          if (!(await this.isAdmin(message.chat.id, message.from.id)))
+            throw new Error('Права администратора не подтверждены.');
+          safety.enable(message.chat.id, id, message.from.id);
+          await this.reply(
+            message,
+            `ACTIVE включён на 7 дней: автоматическое удаление сообщений выше проверенного порога, не более одного в минуту. Банов и мутов нет. Отключить: /spam mode SHADOW`,
+          );
+        } else if (action === 'sample' || action === 'review') {
+          const messageId =
+            action === 'sample'
+              ? safety.nextSample(message.chat.id, id)
+              : safety.reviewMessage(message.chat.id, Number(id));
+          if (messageId === null) {
+            await this.reply(message, 'Нет новых неразмеченных примеров в этой проверке.');
+            return true;
+          }
+          if (!this.store.isCurrent(messageId))
+            throw new Error(
+              'Пример отредактирован; прежнюю редакцию нельзя проверить этой карточкой. Начните новую проверку допуска.',
+            );
+          const item = this.store.createCase(messageId);
+          if (item.card_id !== null || item.status !== 'PENDING')
+            throw new Error(
+              `Проверка уже существует: ${item.status}, ${item.id}. Завершите её; при истёкшей проверке начните новый допуск.`,
+            );
+          await this.sendCard(
+            item,
+            action === 'sample'
+              ? 'Ручная разметка контрольной выборки (оценка модели скрыта)'
+              : 'Проверка автоматического удаления. Normal отключит ACTIVE. Удалённое сообщение автоматически не восстановится.',
+            message.message_id,
+          );
+        } else throw new Error('Команды допуска: prepare, sample, check, enable, log, review.');
+      } catch (error) {
+        await this.reply(message, error instanceof Error ? error.message : 'Допуск не изменён.');
+      }
+      return true;
+    }
     if (/^(?:mode|models|rollback|threshold|metrics|calibrate)(?:\s|$)/.test(arg)) {
       try {
         const [command, value, extra] = arg.split(/\s+/);
@@ -125,13 +200,13 @@ export class SpamTelegram {
           this.learning.current(message.chat.id);
           await this.reply(
             message,
-            `Активирована версия ${value} с её сохранённым порогом. Режим группы сохранён.`,
+            `Активирована версия ${value} с её сохранённым порогом. Допуск ACTIVE отозван.`,
           );
         } else if (command === 'threshold' && value && extra && arg.split(/\s+/).length === 3) {
           governance.setThreshold(message.chat.id, value, Number(extra), message.from.id);
           await this.reply(
             message,
-            `Для модели ${value} установлен порог ${Number(extra)}. Старые прогнозы не пересчитаны.`,
+            `Для модели ${value} установлен порог ${Number(extra)}. Допуск ACTIVE отозван. Старые прогнозы не пересчитаны.`,
           );
         } else if ((command === 'metrics' || command === 'calibrate') && !extra) {
           const version = value ?? current?.version;
@@ -156,7 +231,7 @@ export class SpamTelegram {
               `Модель ${version}. Проверяемый порог: ${result.threshold}.\nCalibration: ${result.calibrationSize}, ${formatQuality(result.calibration)}\nБолее поздний holdout: ${result.holdoutSize}, ${formatQuality(result.holdout)}\nЭто подбор порога на размеченной выборке, не калибровка вероятностей и не гарантия качества. Порог не изменён.\n${result.accepted ? `Проверка holdout пройдена. Применить: /spam threshold ${version} ${result.threshold}` : 'Holdout не подтвердил качество: применение не рекомендуется. Соберите новую разметку; другой порог по holdout не подбирается.'}`,
             );
           } else {
-            const byMode = ['SHADOW', 'LEARNING']
+            const byMode = ['SHADOW', 'LEARNING', 'ACTIVE']
               .map(
                 (mode) =>
                   `${mode}: ${rows.filter((r) => r.mode === mode).length} прогнозов; ${formatQuality(quality(evaluationGroups(rows.filter((r) => r.mode === mode)), row.threshold))}`,
@@ -174,7 +249,7 @@ export class SpamTelegram {
           }
         } else
           throw new Error(
-            '/spam mode SHADOW|LEARNING\n/spam models\n/spam rollback <version>\n/spam threshold <version> <0.05–1>\n/spam metrics [version]\n/spam calibrate [version]',
+            '/spam mode SHADOW|LEARNING\n/spam models\n/spam rollback <version>\n/spam threshold <version> <0.05–1>\n/spam metrics [version]\n/spam calibrate [version]\n/spam active prepare <version>\n/spam active sample <id>\n/spam active check <id>\n/spam active enable <id>',
           );
       } catch (error) {
         await this.reply(
@@ -209,11 +284,12 @@ export class SpamTelegram {
       const stats = this.store.stats(message.chat.id);
       const current = this.learning.current(message.chat.id);
       const metrics = current?.classifier.model.metrics;
+      const policy = this.store.governance.policy(message.chat.id, current?.version ?? '');
       await this.reply(
         message,
-        `Антиспам: ${this.store.governance.policy(message.chat.id, current?.version ?? '').mode}, модель: ${current?.version ?? 'COLD_START'}. Порог: ${this.store.governance.policy(message.chat.id, current?.version ?? '').threshold}. Автоудаление отключено.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}/50\nУникальных normal: ${stats?.normal}/200\nОжидают решения: ${stats?.pending}` +
+        `Антиспам: ${policy.mode}, модель: ${current?.version ?? 'COLD_START'}. Порог: ${policy.threshold}. Автоудаление ${policy.mode === 'ACTIVE' ? 'включено по допуску администратора' : 'отключено'}.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}/50\nУникальных normal: ${stats?.normal}/200\nОжидают решения: ${stats?.pending}` +
           (metrics
-            ? `\nValidation базовой модели, без контекстных сигналов, при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭто экспериментальная оценка; автоматические наказания запрещены. Similarity, кампании и поведение влияют только на приоритет проверки.`
+            ? `\nValidation базовой модели, без контекстных сигналов, при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭти validation-метрики не являются допуском ACTIVE. Similarity, кампании и поведение входят в итоговую оценку.`
             : '\nДля первого обучения: /spam train') +
           (current
             ? `\nПризнаки: ${current.classifier.model.format === 3 ? 'char + word TF-IDF + числовые + Markov' : current.classifier.model.format === 2 ? 'char + word TF-IDF + числовые; Markov: /spam train' : 'только char TF-IDF; обновление: /spam train'}`
@@ -236,7 +312,7 @@ export class SpamTelegram {
     if (arg !== 'review' || !message.reply_to_message) {
       await this.reply(
         message,
-        '/spam review — ответом на сообщение для разметки.\n/spam train\n/spam status\n/spam stats\n/spam undo <id решения>\n/spam mode SHADOW|LEARNING\n/spam models\n/spam rollback <version>\n/spam threshold <version> <0.05–1>\n/spam metrics [version]\n/spam calibrate [version]',
+        '/spam review — ответом на сообщение для разметки.\n/spam train\n/spam status\n/spam stats\n/spam undo <id решения>\n/spam mode SHADOW|LEARNING\n/spam models\n/spam rollback <version>\n/spam threshold <version> <0.05–1>\n/spam metrics [version]\n/spam calibrate [version]\n/spam active prepare <version>\n/spam active sample <id>\n/spam active check <id>\n/spam active enable <id>',
       );
       return true;
     }
@@ -333,6 +409,12 @@ export class SpamTelegram {
       policy,
     );
     if (predictionId === null) return;
+    if (
+      activeAction(score, protectedUser, policy.threshold, policy.mode === 'ACTIVE') === 'DELETE'
+    ) {
+      await this.deleteActive(message, messageId, predictionId, current.version);
+      return;
+    }
     if (policy.mode === 'SHADOW' || limited || result.decision !== 'ASK_ADMIN') return;
     const item = this.store.createCase(messageId, Date.now(), predictionId);
     if (item.card_id !== null || item.status !== 'PENDING') return;
@@ -340,6 +422,58 @@ export class SpamTelegram {
       item,
       `Возможный спам — нужна проверка администратора.\nПриоритет проверки: ${((score ?? 0) * 100).toFixed(1)}/100 (не вероятность).\nКлассификатор: ${((assessment.classifierScore ?? 0) * 100).toFixed(1)}%\nMarkov: ${assessment.markovScore === null ? 'нет оценки' : `${(assessment.markovScore * 100).toFixed(1)}%`}\nSimilarity spam/normal: ${signals.spamSimilarity?.toFixed(2) ?? '—'}/${signals.normalSimilarity?.toFixed(2) ?? '—'}\nПохожих авторов за 10 мин: ${signals.campaignUsers}; сообщений автора за 60 с: ${signals.messagesLast60s}\nПоведение: ${signals.behaviorScore.toFixed(2)}; общих URL с другими авторами: ${signals.sameUrlOtherUsers}\nМодель: ${current.version}`,
     );
+  }
+
+  private async canDelete(chatId: number): Promise<boolean> {
+    try {
+      const me = await this.api.getMe();
+      const member = await this.api.getChatMember(chatId, me.id);
+      return (
+        member.status === 'creator' ||
+        (member.status === 'administrator' && member.can_delete_messages)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private async deleteActive(
+    message: Message,
+    messageId: number,
+    predictionId: number,
+    version: string,
+  ) {
+    const safety = this.store.governance.active;
+    const grant = safety.grant(message.chat.id, version);
+    if (!grant || !message.from || message.from.is_bot || message.sender_chat) return;
+    try {
+      const [allowed, administrator, target] = await Promise.all([
+        this.canDelete(message.chat.id),
+        this.isAdmin(message.chat.id, grant.admin_id),
+        this.api.getChatMember(message.chat.id, message.from.id),
+      ]);
+      if (!allowed || !administrator) {
+        safety.revoke(message.chat.id, 'permissions_changed');
+        return;
+      }
+      if (target.user.is_bot || target.status === 'administrator' || target.status === 'creator')
+        return;
+    } catch {
+      safety.revoke(message.chat.id, 'permission_check_failed');
+      return;
+    }
+    // No await between the final local guards, durable claim and Telegram request.
+    const live = safety.grant(message.chat.id, version);
+    if (!live || live.evaluation_id !== grant.evaluation_id || !this.store.isCurrent(messageId))
+      return;
+    if (!safety.claim(predictionId, live)) return;
+    try {
+      await this.api.deleteMessage(message.chat.id, message.message_id);
+      safety.finish(predictionId, 'DELETED');
+    } catch {
+      safety.finish(predictionId, 'FAILED_OR_UNKNOWN');
+      safety.revoke(message.chat.id, 'delete_failed_or_unknown');
+    }
   }
 
   private async sendCard(
