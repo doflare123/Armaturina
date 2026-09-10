@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Message } from 'grammy/types';
+import { type PredictionPolicy, SpamGovernance } from './governance.ts';
 import { type ModelArtifact, type Sample, validateModel } from './model.ts';
 import { normalizeMessage } from './normalizer.ts';
 
@@ -26,6 +27,7 @@ export interface ReviewCase {
 /** SQLite owns arbitration; no network request is made inside a transaction. */
 export class SpamStore {
   private readonly db: DatabaseSync;
+  readonly governance: SpamGovernance;
 
   constructor(file: string) {
     if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
@@ -40,23 +42,24 @@ export class SpamStore {
         version !== 3 &&
         version !== 4 &&
         version !== 5 &&
-        version !== 6
+        version !== 6 &&
+        version !== 7
       )
         throw new Error('Unsupported antispam schema version');
       if (version === 0) this.migrate();
       if (version === 0 || version === 1) this.migrateModels();
       if (version === 0 || version === 1 || version === 2) this.migrateRevisions();
-      if (version !== 4 && version !== 5 && version !== 6)
+      if (Number(version) < 4)
         this.db.exec(`BEGIN IMMEDIATE;
         ALTER TABLE predictions ADD COLUMN markov_score REAL CHECK(markov_score BETWEEN 0 AND 1);
         ALTER TABLE predictions ADD COLUMN final_score REAL CHECK(final_score BETWEEN 0 AND 1);
         UPDATE predictions SET final_score=classifier_score;
         PRAGMA user_version=4; COMMIT;`);
-      if (version !== 5 && version !== 6)
+      if (Number(version) < 5)
         this.db.exec(`BEGIN IMMEDIATE;
         ALTER TABLE moderation_cases ADD COLUMN command_message_id INTEGER;
         PRAGMA user_version=5; COMMIT;`);
-      if (version !== 6)
+      if (Number(version) < 6)
         this.db.exec(`BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS observed_messages (
           chat_id INTEGER NOT NULL, telegram_message_id INTEGER NOT NULL,
@@ -72,6 +75,8 @@ export class SpamStore {
           prediction_id INTEGER PRIMARY KEY REFERENCES predictions(id) ON DELETE CASCADE,
           policy_version INTEGER NOT NULL, signals_json TEXT NOT NULL);
         PRAGMA user_version=6; COMMIT;`);
+      if (Number(version) < 7) SpamGovernance.migrate(this.db);
+      this.governance = new SpamGovernance(this.db);
     } catch (error) {
       this.db.close();
       throw error;
@@ -178,6 +183,7 @@ export class SpamStore {
     const model = validateModel(input);
     const version = randomUUID();
     this.transaction(() => {
+      const previous = this.activeModel(chatId)?.version ?? null;
       this.db.prepare('UPDATE model_versions SET active=0 WHERE chat_id=?').run(chatId);
       this.db
         .prepare('INSERT INTO model_versions VALUES (?,?,?,?,?,?,1)')
@@ -189,8 +195,48 @@ export class SpamStore {
           JSON.stringify(model.metrics),
           datasetHash,
         );
+      this.governance.audit(chatId, null, 'trained', { version, previous });
     });
     return version;
+  }
+
+  modelVersions(chatId: number) {
+    return this.db
+      .prepare(`SELECT version,trained_at,active,metrics_json,
+      COALESCE((SELECT threshold FROM model_thresholds t WHERE t.version=m.version),0.6) AS threshold
+      FROM model_versions m WHERE chat_id=? ORDER BY trained_at DESC,rowid DESC LIMIT 20`)
+      .all(chatId) as {
+      version: string;
+      trained_at: number;
+      active: number;
+      metrics_json: string;
+      threshold: number;
+    }[];
+  }
+
+  modelArtifact(chatId: number, version: string): ModelArtifact {
+    const row = this.db
+      .prepare('SELECT artifact_json FROM model_versions WHERE chat_id=? AND version=?')
+      .get(chatId, version);
+    if (!row) throw new Error('Модель не найдена в этой группе.');
+    return validateModel(JSON.parse(String(row.artifact_json)));
+  }
+
+  rollback(chatId: number, version: string, adminId: number) {
+    this.transaction(() => {
+      const row = this.db
+        .prepare('SELECT artifact_json FROM model_versions WHERE chat_id=? AND version=?')
+        .get(chatId, version);
+      if (!row) throw new Error('Версия не найдена в этой группе.');
+      validateModel(JSON.parse(String(row.artifact_json)));
+      const previous = this.activeModel(chatId)?.version ?? null;
+      if (previous === version) throw new Error('Эта версия уже активна.');
+      this.db.prepare('UPDATE model_versions SET active=0 WHERE chat_id=?').run(chatId);
+      this.db
+        .prepare('UPDATE model_versions SET active=1 WHERE chat_id=? AND version=?')
+        .run(chatId, version);
+      this.governance.audit(chatId, adminId, 'rollback', { previous, version });
+    });
   }
 
   prediction(
@@ -202,6 +248,7 @@ export class SpamStore {
     markovScore: number | null = null,
     finalScore: number | null = score,
     signals?: import('./signals.ts').SignalAssessment,
+    policy?: PredictionPolicy,
   ): number | null {
     return this.transaction(() => {
       const inserted = this.db
@@ -222,6 +269,7 @@ export class SpamStore {
         );
       const id = inserted.changes ? Number(inserted.lastInsertRowid) : null;
       if (id !== null && signals) this.saveSignals(id, signals);
+      if (id !== null && policy) this.governance.record(id, policy);
       return id;
     });
   }

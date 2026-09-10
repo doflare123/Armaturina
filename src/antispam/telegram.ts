@@ -3,10 +3,16 @@ import type { CallbackQuery, Message } from 'grammy/types';
 import { TechnicalCleanup } from '../bot/technicalCleanup.ts';
 import type { SpamConfig } from './config.ts';
 import { decide } from './decision.ts';
+import { calibrate, evaluationGroups, quality } from './governance.ts';
 import { LearningService } from './learning.ts';
 import type { SpamClassifier } from './model.ts';
 import { ContextSignals, contextualScore } from './signals.ts';
 import { SpamStore, type Verdict } from './store.ts';
+
+function formatQuality(metrics: ReturnType<typeof quality>): string {
+  const pct = (value: number | null) => (value === null ? '—' : `${(value * 100).toFixed(1)}%`);
+  return `TP/FP/TN/FN ${metrics.tp}/${metrics.fp}/${metrics.tn}/${metrics.fn}; precision ${pct(metrics.precision)}, recall ${pct(metrics.recall)}, F1 ${pct(metrics.f1)}, FPR ${pct(metrics.falsePositiveRate)}`;
+}
 
 /** LEARNING adapter: local model suggestions, human feedback, no automatic punishment. */
 export class SpamTelegram {
@@ -92,6 +98,92 @@ export class SpamTelegram {
     }
     const input = command[2]?.trim() ?? 'status';
     const arg = input === 'rewiev' ? 'review' : input;
+    if (/^(?:mode|models|rollback|threshold|metrics|calibrate)(?:\s|$)/.test(arg)) {
+      try {
+        const [command, value, extra] = arg.split(/\s+/);
+        const current = this.learning.current(message.chat.id);
+        const governance = this.store.governance;
+        if (command === 'mode' && !extra && (value === 'SHADOW' || value === 'LEARNING')) {
+          governance.setMode(message.chat.id, value, message.from.id);
+          await this.reply(
+            message,
+            `Режим ${value}. ${value === 'SHADOW' ? 'Оценки сохраняются, новые автоматические карточки выключены. Ручная разметка доступна.' : 'Предложения администраторам включены.'} Автоматических наказаний нет.`,
+          );
+        } else if (command === 'models' && !value) {
+          const versions = this.store.modelVersions(message.chat.id);
+          await this.reply(
+            message,
+            versions
+              .map(
+                (v) =>
+                  `${v.active ? 'АКТИВНА' : 'архив'} ${v.version}\n${new Date(v.trained_at).toISOString()} · порог ${v.threshold}`,
+              )
+              .join('\n') || 'Моделей пока нет.',
+          );
+        } else if (command === 'rollback' && value && !extra) {
+          this.store.rollback(message.chat.id, value, message.from.id);
+          this.learning.current(message.chat.id);
+          await this.reply(
+            message,
+            `Активирована версия ${value} с её сохранённым порогом. Режим группы сохранён.`,
+          );
+        } else if (command === 'threshold' && value && extra && arg.split(/\s+/).length === 3) {
+          governance.setThreshold(message.chat.id, value, Number(extra), message.from.id);
+          await this.reply(
+            message,
+            `Для модели ${value} установлен порог ${Number(extra)}. Старые прогнозы не пересчитаны.`,
+          );
+        } else if ((command === 'metrics' || command === 'calibrate') && !extra) {
+          const version = value ?? current?.version;
+          if (!version) throw new Error('Выберите версию из /spam models.');
+          // Full artifact lookup is scoped to this group, including archived versions.
+          const model = this.store.modelArtifact(message.chat.id, version);
+          const row = governance.policy(message.chat.id, version);
+          const rows = governance.rows(message.chat.id, version, [
+            ...model.trainHashes,
+            ...model.validationHashes,
+          ]);
+          const groups = evaluationGroups(rows);
+          if (command === 'calibrate') {
+            const result = calibrate(rows);
+            governance.audit(message.chat.id, message.from.id, 'calibration', {
+              version,
+              ...result,
+              predictionIds: groups.map((r) => r.id),
+            });
+            await this.reply(
+              message,
+              `Модель ${version}. Проверяемый порог: ${result.threshold}.\nCalibration: ${result.calibrationSize}, ${formatQuality(result.calibration)}\nБолее поздний holdout: ${result.holdoutSize}, ${formatQuality(result.holdout)}\nЭто подбор порога на размеченной выборке, не калибровка вероятностей и не гарантия качества. Порог не изменён.\n${result.accepted ? `Проверка holdout пройдена. Применить: /spam threshold ${version} ${result.threshold}` : 'Holdout не подтвердил качество: применение не рекомендуется. Соберите новую разметку; другой порог по holdout не подбирается.'}`,
+            );
+          } else {
+            const byMode = ['SHADOW', 'LEARNING']
+              .map(
+                (mode) =>
+                  `${mode}: ${rows.filter((r) => r.mode === mode).length} прогнозов; ${formatQuality(quality(evaluationGroups(rows.filter((r) => r.mode === mode)), row.threshold))}`,
+              )
+              .join('\n');
+            const thresholds = [...new Set(rows.map((r) => r.threshold))].sort((a, b) => a - b);
+            const historical = quality(
+              groups.map((r) => ({ label: r.label, score: r.score >= r.threshold ? 1 : 0 })),
+              0.5,
+            );
+            await this.reply(
+              message,
+              `Модель ${version}, контекстная политика 1, последние 30 дней (до 10000 прогнозов до фильтрации).\nНовых пригодных прогнозов: ${rows.length}; ${byMode}.\nРазмеченных уникальных групп: ${groups.length}. Неразмеченные не считаются normal.\nПересчёт при текущем пороге ${row.threshold}: ${formatQuality(quality(groups, row.threshold))}\nПо историческим порогам, до cooldown: ${formatQuality(historical)}\nИсторические пороги: ${thresholds.join(', ') || '—'}.\nЭто метрики выбранных для ручной проверки сообщений, не всего чата. Train/validation и противоречивые дубликаты исключены.`,
+            );
+          }
+        } else
+          throw new Error(
+            '/spam mode SHADOW|LEARNING\n/spam models\n/spam rollback <version>\n/spam threshold <version> <0.05–1>\n/spam metrics [version]\n/spam calibrate [version]',
+          );
+      } catch (error) {
+        await this.reply(
+          message,
+          error instanceof Error ? error.message : 'Операция не выполнена.',
+        );
+      }
+      return true;
+    }
     if (arg === 'train') {
       // Do not hold the per-chat update queue while CPU work runs in another thread.
       const task = this.learning.train(message.chat.id);
@@ -101,7 +193,7 @@ export class SpamTelegram {
             if (!this.closed)
               await this.reply(
                 message,
-                `Модель ${version} обучена. Включены только предложения, автоудаление отключено.`,
+                `Модель ${version} обучена. Режим ${this.store.governance.policy(message.chat.id, version).mode}; автоудаление отключено.`,
               );
           },
           async (error: Error) => {
@@ -119,7 +211,7 @@ export class SpamTelegram {
       const metrics = current?.classifier.model.metrics;
       await this.reply(
         message,
-        `Антиспам: LEARNING, модель: ${current?.version ?? 'COLD_START'}. Автоудаление отключено.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}/50\nУникальных normal: ${stats?.normal}/200\nОжидают решения: ${stats?.pending}` +
+        `Антиспам: ${this.store.governance.policy(message.chat.id, current?.version ?? '').mode}, модель: ${current?.version ?? 'COLD_START'}. Порог: ${this.store.governance.policy(message.chat.id, current?.version ?? '').threshold}. Автоудаление отключено.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}/50\nУникальных normal: ${stats?.normal}/200\nОжидают решения: ${stats?.pending}` +
           (metrics
             ? `\nValidation базовой модели, без контекстных сигналов, при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭто экспериментальная оценка; автоматические наказания запрещены. Similarity, кампании и поведение влияют только на приоритет проверки.`
             : '\nДля первого обучения: /spam train') +
@@ -144,7 +236,7 @@ export class SpamTelegram {
     if (arg !== 'review' || !message.reply_to_message) {
       await this.reply(
         message,
-        '/spam review — ответом на сообщение для разметки.\n/spam train\n/spam status\n/spam stats\n/spam undo <id решения>',
+        '/spam review — ответом на сообщение для разметки.\n/spam train\n/spam status\n/spam stats\n/spam undo <id решения>\n/spam mode SHADOW|LEARNING\n/spam models\n/spam rollback <version>\n/spam threshold <version> <0.05–1>\n/spam metrics [version]\n/spam calibrate [version]',
       );
       return true;
     }
@@ -205,6 +297,8 @@ export class SpamTelegram {
     } catch {
       /* Unknown permissions suppress suggestions. */
     }
+    // A worker or another connection may activate/rollback a model while Telegram is awaited.
+    if (this.store.activeModel(message.chat.id)?.version !== current.version) return;
     let engine = this.signals.get(current.classifier);
     if (!engine) {
       engine = new ContextSignals(current.classifier);
@@ -219,10 +313,14 @@ export class SpamTelegram {
       this.store.signalContext(message.chat.id, message.from?.id ?? 0, message.message_id, now),
     );
     const score = contextualScore(assessment.finalScore, signals);
-    const result = decide(score, protectedUser);
-    if (result.decision === 'ASK_ADMIN' && (assessment.finalScore ?? 0) < 0.6)
+    const policy = this.store.governance.policy(message.chat.id, current.version);
+    const result = decide(score, protectedUser, policy.threshold);
+    if (result.decision === 'ASK_ADMIN' && (assessment.finalScore ?? 0) < policy.threshold)
       result.reason = 'context_above_review_threshold';
-    const limited = result.decision === 'ASK_ADMIN' && !this.store.canPropose(message.chat.id);
+    const limited =
+      policy.mode !== 'SHADOW' &&
+      result.decision === 'ASK_ADMIN' &&
+      !this.store.canPropose(message.chat.id);
     const predictionId = this.store.prediction(
       messageId,
       current.version,
@@ -232,9 +330,10 @@ export class SpamTelegram {
       assessment.markovScore,
       score,
       signals,
+      policy,
     );
     if (predictionId === null) return;
-    if (limited || result.decision !== 'ASK_ADMIN') return;
+    if (policy.mode === 'SHADOW' || limited || result.decision !== 'ASK_ADMIN') return;
     const item = this.store.createCase(messageId, Date.now(), predictionId);
     if (item.card_id !== null || item.status !== 'PENDING') return;
     await this.sendCard(

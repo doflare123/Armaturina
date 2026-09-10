@@ -48,6 +48,7 @@ export class LearningService {
         new Error(`COLD_START: уникальных spam ${split.spam}/50, normal ${split.normal}/200.`),
       );
     const hash = fingerprint(samples);
+    const revision = this.store.governance.revision(chatId);
     // URL points to .ts in source runs and .js in compiled runs.
     const extension = import.meta.url.endsWith('.ts') ? 'ts' : 'js';
     const worker = new Worker(new URL(`./trainWorker.${extension}`, import.meta.url), {
@@ -81,6 +82,10 @@ export class LearningService {
         try {
           if (this.closed) throw new Error('Service closed');
           if (!result.model) throw new Error(result.error ?? 'Training failed');
+          if (this.store.governance.revision(chatId) !== revision)
+            throw new Error(
+              'Настройки или активная модель изменились во время обучения. Результат не активирован.',
+            );
           if (fingerprint(this.store.dataset(chatId)) !== hash)
             throw new Error('Разметка изменилась во время обучения. Повторите /spam train.');
           const classifier = new SpamClassifier(result.model);

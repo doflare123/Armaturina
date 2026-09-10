@@ -3,11 +3,13 @@ export interface Decision {
   reason: string;
 }
 /** Deliberately cannot return DELETE in phase 2, even for score=1. */
-export function decide(score: number | null, protectedUser = false): Decision {
+export function decide(score: number | null, protectedUser = false, threshold = 0.6): Decision {
   if (protectedUser) return { decision: 'ALLOW', reason: 'protected_user' };
   if (score === null || !Number.isFinite(score) || score < 0 || score > 1)
     return { decision: 'ALLOW', reason: 'no_valid_score' };
-  return score >= 0.6
+  if (!Number.isFinite(threshold) || threshold < 0.05 || threshold > 1)
+    return { decision: 'ALLOW', reason: 'invalid_threshold' };
+  return score >= threshold
     ? { decision: 'ASK_ADMIN', reason: 'classifier_above_review_threshold' }
     : { decision: 'ALLOW', reason: 'below_review_threshold' };
 }

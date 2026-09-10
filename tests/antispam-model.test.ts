@@ -151,7 +151,7 @@ test('schema v1 migration preserves messages and labels and adds constrained pre
   try {
     const inspect = new DatabaseSync(file);
     try {
-      assert.equal(inspect.prepare('PRAGMA user_version').get()?.user_version, 6);
+      assert.equal(inspect.prepare('PRAGMA user_version').get()?.user_version, 7);
       assert.equal(inspect.prepare('SELECT label FROM labels').get()?.label, 0);
       const version = store.activateModel(-12, model, 'snapshot');
       assert.ok(store.prediction(1, version, 0.8, 'ASK_ADMIN', 'test', 0.7, 0.79));
