@@ -206,6 +206,15 @@ export class SpamClassifier {
     return vector.length ? probability(vector, this.model.weights, this.model.intercept) : null;
   }
 
+  /** L2-normalized char TF-IDF in this model's frozen training vocabulary. */
+  similarityVector(normalizedText: string): SparseVector {
+    if (normalizedText.length < 12 || normalizedText.length > 4096) return [];
+    const counts = charCounts(normalizedText);
+    const known = [...counts.keys()].filter((term) => this.vocabulary.has(term)).length;
+    if (known < counts.size * 0.5) return [];
+    return vectorize(normalizedText, this.vocabulary, this.model.idf, counts);
+  }
+
   assess(rawText: string, entities: readonly Entity[] = []) {
     const classifierScore = this.classify(rawText, entities);
     const markovScore =

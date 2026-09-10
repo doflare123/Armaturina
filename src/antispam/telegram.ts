@@ -4,6 +4,8 @@ import { TechnicalCleanup } from '../bot/technicalCleanup.ts';
 import type { SpamConfig } from './config.ts';
 import { decide } from './decision.ts';
 import { LearningService } from './learning.ts';
+import type { SpamClassifier } from './model.ts';
+import { ContextSignals, contextualScore } from './signals.ts';
 import { SpamStore, type Verdict } from './store.ts';
 
 /** LEARNING adapter: local model suggestions, human feedback, no automatic punishment. */
@@ -15,6 +17,7 @@ export class SpamTelegram {
   private closed = false;
   private readonly timer: ReturnType<typeof setInterval>;
   private readonly cleanup: TechnicalCleanup;
+  private readonly signals = new WeakMap<SpamClassifier, ContextSignals>();
 
   constructor(api: Api, config: SpamConfig) {
     this.api = api;
@@ -61,6 +64,7 @@ export class SpamTelegram {
 
   async message(message: Message, botUsername: string, updateId?: number): Promise<boolean> {
     if (!this.enabled(message)) return false;
+    this.store.observeJoins(message);
     const command = /^\/spam(?:@([a-z0-9_]+))?(?:\s+(.*))?$/iu.exec(message.text ?? '');
     if (!command) {
       if (!message.from?.is_bot || message.sender_chat) {
@@ -117,7 +121,7 @@ export class SpamTelegram {
         message,
         `Антиспам: LEARNING, модель: ${current?.version ?? 'COLD_START'}. Автоудаление отключено.\nСообщений: ${stats?.messages}\nУникальных spam: ${stats?.spam}/50\nУникальных normal: ${stats?.normal}/200\nОжидают решения: ${stats?.pending}` +
           (metrics
-            ? `\nValidation при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭто экспериментальная оценка; автоматические наказания запрещены.`
+            ? `\nValidation базовой модели, без контекстных сигналов, при пороге 0.60: precision ${(metrics.precision * 100).toFixed(1)}%, recall ${(metrics.recall * 100).toFixed(1)}%, F1 ${(metrics.f1 * 100).toFixed(1)}%, FPR ${(metrics.falsePositiveRate * 100).toFixed(1)}%\nЭто экспериментальная оценка; автоматические наказания запрещены. Similarity, кампании и поведение влияют только на приоритет проверки.`
             : '\nДля первого обучения: /spam train') +
           (current
             ? `\nПризнаки: ${current.classifier.model.format === 3 ? 'char + word TF-IDF + числовые + Markov' : current.classifier.model.format === 2 ? 'char + word TF-IDF + числовые; Markov: /spam train' : 'только char TF-IDF; обновление: /spam train'}`
@@ -186,6 +190,8 @@ export class SpamTelegram {
   }
 
   private async suggest(message: Message, messageId: number) {
+    this.store.observe(message, messageId);
+    if (this.store.hasPrediction(messageId)) return;
     const current = this.learning.current(message.chat.id);
     if (!current) return;
     const assessment = current.classifier.assess(
@@ -199,8 +205,23 @@ export class SpamTelegram {
     } catch {
       /* Unknown permissions suppress suggestions. */
     }
-    const score = assessment.finalScore;
+    let engine = this.signals.get(current.classifier);
+    if (!engine) {
+      engine = new ContextSignals(current.classifier);
+      this.signals.set(current.classifier, engine);
+    }
+    const now = Date.now();
+    const signals = engine.assess(
+      message.text ?? message.caption ?? '',
+      message.entities ?? message.caption_entities ?? [],
+      message.from?.id ?? 0,
+      now,
+      this.store.signalContext(message.chat.id, message.from?.id ?? 0, message.message_id, now),
+    );
+    const score = contextualScore(assessment.finalScore, signals);
     const result = decide(score, protectedUser);
+    if (result.decision === 'ASK_ADMIN' && (assessment.finalScore ?? 0) < 0.6)
+      result.reason = 'context_above_review_threshold';
     const limited = result.decision === 'ASK_ADMIN' && !this.store.canPropose(message.chat.id);
     const predictionId = this.store.prediction(
       messageId,
@@ -210,13 +231,15 @@ export class SpamTelegram {
       limited ? 'review_rate_limited' : result.reason,
       assessment.markovScore,
       score,
+      signals,
     );
-    if (predictionId === null || limited || result.decision !== 'ASK_ADMIN') return;
+    if (predictionId === null) return;
+    if (limited || result.decision !== 'ASK_ADMIN') return;
     const item = this.store.createCase(messageId, Date.now(), predictionId);
     if (item.card_id !== null || item.status !== 'PENDING') return;
     await this.sendCard(
       item,
-      `Возможный спам — нужна проверка администратора.\nИтог: ${((score ?? 0) * 100).toFixed(1)}% (не гарантия).\nКлассификатор: ${((assessment.classifierScore ?? 0) * 100).toFixed(1)}%\nMarkov: ${assessment.markovScore === null ? 'нет оценки' : `${(assessment.markovScore * 100).toFixed(1)}%`}\nМодель: ${current.version}`,
+      `Возможный спам — нужна проверка администратора.\nПриоритет проверки: ${((score ?? 0) * 100).toFixed(1)}/100 (не вероятность).\nКлассификатор: ${((assessment.classifierScore ?? 0) * 100).toFixed(1)}%\nMarkov: ${assessment.markovScore === null ? 'нет оценки' : `${(assessment.markovScore * 100).toFixed(1)}%`}\nSimilarity spam/normal: ${signals.spamSimilarity?.toFixed(2) ?? '—'}/${signals.normalSimilarity?.toFixed(2) ?? '—'}\nПохожих авторов за 10 мин: ${signals.campaignUsers}; сообщений автора за 60 с: ${signals.messagesLast60s}\nПоведение: ${signals.behaviorScore.toFixed(2)}; общих URL с другими авторами: ${signals.sameUrlOtherUsers}\nМодель: ${current.version}`,
     );
   }
 

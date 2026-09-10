@@ -39,22 +39,39 @@ export class SpamStore {
         version !== 2 &&
         version !== 3 &&
         version !== 4 &&
-        version !== 5
+        version !== 5 &&
+        version !== 6
       )
         throw new Error('Unsupported antispam schema version');
       if (version === 0) this.migrate();
       if (version === 0 || version === 1) this.migrateModels();
       if (version === 0 || version === 1 || version === 2) this.migrateRevisions();
-      if (version !== 4 && version !== 5)
+      if (version !== 4 && version !== 5 && version !== 6)
         this.db.exec(`BEGIN IMMEDIATE;
         ALTER TABLE predictions ADD COLUMN markov_score REAL CHECK(markov_score BETWEEN 0 AND 1);
         ALTER TABLE predictions ADD COLUMN final_score REAL CHECK(final_score BETWEEN 0 AND 1);
         UPDATE predictions SET final_score=classifier_score;
         PRAGMA user_version=4; COMMIT;`);
-      if (version !== 5)
+      if (version !== 5 && version !== 6)
         this.db.exec(`BEGIN IMMEDIATE;
         ALTER TABLE moderation_cases ADD COLUMN command_message_id INTEGER;
         PRAGMA user_version=5; COMMIT;`);
+      if (version !== 6)
+        this.db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS observed_messages (
+          chat_id INTEGER NOT NULL, telegram_message_id INTEGER NOT NULL,
+          message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          user_id INTEGER NOT NULL, sent_at INTEGER NOT NULL, changed_at INTEGER NOT NULL,
+          PRIMARY KEY(chat_id,telegram_message_id));
+        CREATE INDEX IF NOT EXISTS observed_user ON observed_messages(chat_id,user_id,sent_at);
+        CREATE INDEX IF NOT EXISTS observed_recent ON observed_messages(chat_id,changed_at);
+        CREATE TABLE IF NOT EXISTS observed_joins (
+          chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,joined_at INTEGER NOT NULL,
+          PRIMARY KEY(chat_id,user_id));
+        CREATE TABLE IF NOT EXISTS prediction_signals (
+          prediction_id INTEGER PRIMARY KEY REFERENCES predictions(id) ON DELETE CASCADE,
+          policy_version INTEGER NOT NULL, signals_json TEXT NOT NULL);
+        PRAGMA user_version=6; COMMIT;`);
     } catch (error) {
       this.db.close();
       throw error;
@@ -184,24 +201,33 @@ export class SpamStore {
     reason: string,
     markovScore: number | null = null,
     finalScore: number | null = score,
+    signals?: import('./signals.ts').SignalAssessment,
   ): number | null {
-    const inserted = this.db
-      .prepare(`INSERT INTO predictions(message_id,model_version,classifier_score,decision,reason,created_at,markov_score,final_score)
+    return this.transaction(() => {
+      const inserted = this.db
+        .prepare(`INSERT INTO predictions(message_id,model_version,classifier_score,decision,reason,created_at,markov_score,final_score)
       SELECT id,?,?,?,?,?,?,? FROM messages WHERE id=? AND telegram_message_id IS NOT NULL
       AND chat_id=(SELECT chat_id FROM model_versions WHERE version=?)
       ON CONFLICT(message_id) DO NOTHING`)
-      .run(
-        version,
-        score,
-        decision,
-        reason,
-        Date.now(),
-        markovScore,
-        finalScore,
-        messageId,
-        version,
-      );
-    return inserted.changes ? Number(inserted.lastInsertRowid) : null;
+        .run(
+          version,
+          score,
+          decision,
+          reason,
+          Date.now(),
+          markovScore,
+          finalScore,
+          messageId,
+          version,
+        );
+      const id = inserted.changes ? Number(inserted.lastInsertRowid) : null;
+      if (id !== null && signals) this.saveSignals(id, signals);
+      return id;
+    });
+  }
+
+  hasPrediction(messageId: number): boolean {
+    return !!this.db.prepare('SELECT 1 FROM predictions WHERE message_id=?').get(messageId);
   }
 
   canPropose(chatId: number, now = Date.now()): boolean {
@@ -450,6 +476,83 @@ export class SpamStore {
       .all(chatId) as unknown as Sample[];
   }
 
+  /** Only live updates call this; reply-based manual capture is not user activity. */
+  observe(message: Message, messageId: number) {
+    if (!message.from || message.from.is_bot || message.sender_chat) return;
+    this.db
+      .prepare(`INSERT INTO observed_messages
+      SELECT chat_id,telegram_message_id,id,user_id,created_at,? FROM messages
+      WHERE id=? AND telegram_message_id IS NOT NULL AND user_id IS NOT NULL
+      ON CONFLICT(chat_id,telegram_message_id) DO UPDATE SET
+        message_id=excluded.message_id, changed_at=excluded.changed_at`)
+      .run((message.edit_date ?? message.date) * 1000, messageId);
+  }
+
+  observeJoins(message: Message) {
+    for (const user of message.new_chat_members ?? []) {
+      if (user.is_bot) continue;
+      this.db
+        .prepare(`INSERT INTO observed_joins VALUES (?,?,?)
+        ON CONFLICT(chat_id,user_id) DO UPDATE SET joined_at=MAX(joined_at,excluded.joined_at)`)
+        .run(message.chat.id, user.id, message.date * 1000);
+    }
+  }
+
+  signalContext(chatId: number, userId: number, sourceId: number, now: number) {
+    const counts = this.db
+      .prepare(`SELECT COUNT(*) AS observed,
+      COUNT(CASE WHEN sent_at>=? THEN 1 END) AS last60s,
+      COUNT(CASE WHEN sent_at>=? THEN 1 END) AS last10m
+      FROM observed_messages WHERE chat_id=? AND user_id=? AND sent_at<=?`)
+      .get(now - 60_000, now - 600_000, chatId, userId, now) as {
+      observed: number;
+      last60s: number;
+      last10m: number;
+    };
+    const join = this.db
+      .prepare(
+        'SELECT joined_at FROM observed_joins WHERE chat_id=? AND user_id=? AND joined_at<=?',
+      )
+      .get(chatId, userId, now) as { joined_at: number } | undefined;
+    const recent = this.db
+      .prepare(`SELECT m.id,m.normalized_text,m.text_hash,m.raw_text,m.metadata,
+      o.user_id,o.changed_at FROM observed_messages o JOIN messages m ON m.id=o.message_id
+      WHERE o.chat_id=? AND o.telegram_message_id<>? AND o.changed_at>=? AND o.changed_at<=?
+      AND m.telegram_message_id IS NOT NULL ORDER BY o.changed_at DESC,m.id DESC LIMIT 500`)
+      .all(
+        chatId,
+        sourceId,
+        now - 3_600_000,
+        now,
+      ) as unknown as import('./signals.ts').RecentMessage[];
+    // Exclude every revision of the assessed message; conflicting labels cannot be exemplars.
+    const references = this.db
+      .prepare(`SELECT m.id,m.normalized_text,l.label FROM messages m
+      JOIN labels l ON l.message_id=m.id
+      WHERE m.chat_id=? AND (m.source_message_id IS NULL OR m.source_message_id<>?)
+      AND l.source IN ('ADMIN_CONFIRMED','ADMIN_REJECTED','BOOTSTRAP') AND l.created_at<=?
+      AND NOT EXISTS (SELECT 1 FROM messages x JOIN labels y ON y.message_id=x.id
+        WHERE x.chat_id=m.chat_id AND x.text_hash=m.text_hash AND y.label<>l.label
+        AND y.source IN ('ADMIN_CONFIRMED','ADMIN_REJECTED','BOOTSTRAP'))
+      GROUP BY m.text_hash ORDER BY MAX(l.created_at) DESC,m.id DESC LIMIT 200`)
+      .all(chatId, sourceId, now) as unknown as import('./signals.ts').ReferenceMessage[];
+    const sinceJoin = join
+      ? Number(
+          this.db
+            .prepare(`SELECT COUNT(*) AS n FROM observed_messages
+      WHERE chat_id=? AND user_id=? AND sent_at BETWEEN ? AND ?`)
+            .get(chatId, userId, join.joined_at, now)?.n,
+        )
+      : null;
+    return { ...counts, joinedAt: join?.joined_at ?? null, sinceJoin, recent, references };
+  }
+
+  private saveSignals(predictionId: number, signals: import('./signals.ts').SignalAssessment) {
+    this.db
+      .prepare('INSERT INTO prediction_signals VALUES (?,1,?)')
+      .run(predictionId, JSON.stringify(signals));
+  }
+
   stats(chatId: number) {
     this.expire(Date.now());
     return this.db
@@ -471,6 +574,9 @@ export class SpamStore {
   }
 
   prune(retentionDays: number, now = Date.now()) {
+    this.db
+      .prepare('DELETE FROM observed_joins WHERE joined_at<?')
+      .run(now - retentionDays * 86_400_000);
     this.db
       .prepare('DELETE FROM messages WHERE created_at<?')
       .run(now - retentionDays * 86_400_000);
