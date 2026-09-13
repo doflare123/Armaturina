@@ -1,6 +1,7 @@
 import type { Entity } from './features.ts';
 import type { SpamClassifier, SparseVector } from './model.ts';
 import { normalizeMessage } from './normalizer.ts';
+import type { InferenceTrace } from './trace.ts';
 
 export interface ReferenceMessage {
   id: number;
@@ -108,9 +109,12 @@ export class ContextSignals {
     userId: number,
     now: number,
     context: SignalContext,
+    trace?: InferenceTrace,
   ): SignalAssessment {
+    const endVector = trace?.begin('similarity_vector');
     const text = normalizeMessage(raw);
     const vector = new Map(this.vector(text.normalizedText));
+    endVector?.({ nonzero_features: vector.size, cache: 'bounded_lru_may_be_warm' });
     const cosine = (other: string): number | null => {
       const candidate = this.vector(other);
       if (!vector.size || !candidate.length) return null;
@@ -124,6 +128,7 @@ export class ContextSignals {
         ),
       );
     };
+    const endSimilarity = trace?.begin('similarity');
     let spamSimilarity: number | null = null,
       normalSimilarity: number | null = null;
     let spamReferenceId: number | null = null,
@@ -140,27 +145,47 @@ export class ContextSignals {
         normalReferenceId = reference.id;
       }
     }
+    endSimilarity?.({
+      spam_similarity: spamSimilarity,
+      normal_similarity: normalSimilarity,
+      spam_reference_id: spamReferenceId,
+      normal_reference_id: normalReferenceId,
+      reference_count: context.references.length,
+      score_kind: 'cosine_similarity_not_probability',
+    });
+    const endCampaign = trace?.begin('campaigns');
     const users = new Set([userId]),
       campaignMessageIds: number[] = [];
+    for (const recent of context.recent) {
+      if (recent.user_id === userId) continue;
+      if (recent.changed_at >= now - 600_000 && (cosine(recent.normalized_text) ?? 0) >= 0.9) {
+        users.add(recent.user_id);
+        campaignMessageIds.push(recent.id);
+      }
+    }
+    const campaignUsers = users.size;
+    const campaignScore =
+      campaignUsers >= 5 ? 1 : campaignUsers >= 3 ? 0.6 : campaignUsers >= 2 ? 0.3 : 0;
+    endCampaign?.({
+      signal: campaignScore,
+      distinct_users: campaignUsers,
+      matched_message_ids: campaignMessageIds,
+      recent_candidates: context.recent.length,
+      score_kind: 'heuristic_not_probability',
+    });
+    const endBehavior = trace?.begin('behavior');
     const urls = messageUrls(raw, entities),
       urlUsers = new Set<number>();
     let duplicatesLastHour = 0;
     for (const recent of context.recent) {
       if (recent.user_id === userId && recent.text_hash === text.textHash) duplicatesLastHour++;
       if (recent.user_id === userId) continue;
-      if (recent.changed_at >= now - 600_000 && (cosine(recent.normalized_text) ?? 0) >= 0.9) {
-        users.add(recent.user_id);
-        campaignMessageIds.push(recent.id);
-      }
       if (urls.size) {
         const metadata = JSON.parse(recent.metadata) as { entities?: Entity[] };
         if ([...messageUrls(recent.raw_text, metadata.entities)].some((url) => urls.has(url)))
           urlUsers.add(recent.user_id);
       }
     }
-    const campaignUsers = users.size;
-    const campaignScore =
-      campaignUsers >= 5 ? 1 : campaignUsers >= 3 ? 0.6 : campaignUsers >= 2 ? 0.3 : 0;
     const secondsSinceJoin = context.joinedAt === null ? null : (now - context.joinedAt) / 1000;
     const behaviorScore = Math.min(
       1,
@@ -170,6 +195,19 @@ export class ContextSignals {
         (urlUsers.size ? 0.3 : 0) +
         (context.last60s > 3 ? 0.2 : 0),
     );
+    endBehavior?.({
+      signal: behaviorScore,
+      first_observed: context.observed === 1,
+      messages_observed: context.observed,
+      url_count: urls.size,
+      seconds_since_join: secondsSinceJoin,
+      messages_last_60s: context.last60s,
+      messages_last_10m: context.last10m,
+      messages_since_join: context.sinceJoin,
+      duplicates_last_hour: duplicatesLastHour,
+      same_url_other_users: urlUsers.size,
+      score_kind: 'heuristic_not_probability',
+    });
     return {
       policyVersion: 1,
       spamSimilarity,

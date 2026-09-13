@@ -1,6 +1,7 @@
 import { type Entity, NUMERIC_FEATURES, scaledNumeric, wordCounts } from './features.ts';
 import { combineScores, type MarkovArtifact, MarkovSignal, validateMarkov } from './markov.ts';
 import { normalizeMessage } from './normalizer.ts';
+import { type InferenceTrace, scoreResult } from './trace.ts';
 
 export interface Sample {
   text_hash: string;
@@ -80,10 +81,43 @@ export function combinedVector(
   idf: number[],
   words: ReadonlyMap<string, number>,
   wordIdf: number[],
+  trace?: InferenceTrace,
 ): SparseVector {
-  const char = vectorize(text, vocabulary, idf);
-  const word = vectorize(text, words, wordIdf, wordCounts(text));
-  const numeric = scaledNumeric(raw, entities);
+  const char = trace
+    ? trace.run(
+        'char_tfidf',
+        () => vectorize(text, vocabulary, idf),
+        (v) => ({
+          nonzero_features: v.length,
+          vocabulary_size: vocabulary.size,
+          spam_score: null,
+          reason: 'feature_extractor_not_classifier',
+        }),
+      )
+    : vectorize(text, vocabulary, idf);
+  const word = trace
+    ? trace.run(
+        'word_tfidf',
+        () => vectorize(text, words, wordIdf, wordCounts(text)),
+        (v) => ({
+          nonzero_features: v.length,
+          vocabulary_size: words.size,
+          spam_score: null,
+          reason: 'feature_extractor_not_classifier',
+        }),
+      )
+    : vectorize(text, words, wordIdf, wordCounts(text));
+  const numeric = trace
+    ? trace.run(
+        'numeric_features',
+        () => scaledNumeric(raw, entities),
+        (v) => ({
+          scaled_values: Object.fromEntries(NUMERIC_FEATURES.map((name, i) => [name, v[i]])),
+          spam_score: null,
+          reason: 'feature_extractor_not_classifier',
+        }),
+      )
+    : scaledNumeric(raw, entities);
   return [
     ...char.map(([i, v]): [number, number] => [i, v / Math.sqrt(3)]),
     ...word.map(([i, v]): [number, number] => [vocabulary.size + i, v / Math.sqrt(3)]),
@@ -187,9 +221,27 @@ export class SpamClassifier {
     this.words = new Map((this.model.wordVocabulary ?? []).map((term, i) => [term, i]));
     this.markov = this.model.format === 3 ? new MarkovSignal(this.model.markov) : null;
   }
-  classify(rawText: string, entities: readonly Entity[] = []): number | null {
-    const text = normalizeMessage(rawText).normalizedText;
-    if (!text.trim() || rawText.length > 16_384 || text.length > 16_384) return null;
+  classify(
+    rawText: string,
+    entities: readonly Entity[] = [],
+    trace?: InferenceTrace,
+  ): number | null {
+    const text = trace
+      ? trace.run(
+          'normalization',
+          () => normalizeMessage(rawText),
+          (v) => ({
+            text_hash: v.textHash,
+            normalizer_version: v.normalizerVersion,
+            normalized_length: v.normalizedText.length,
+          }),
+        ).normalizedText
+      : normalizeMessage(rawText).normalizedText;
+    if (!text.trim() || rawText.length > 16_384 || text.length > 16_384) {
+      for (const stage of ['char_tfidf', 'word_tfidf', 'numeric_features', 'logistic_regression'])
+        trace?.skip(stage, 'empty_or_oversized_text');
+      return null;
+    }
     const vector =
       this.model.format !== 1
         ? combinedVector(
@@ -200,10 +252,61 @@ export class SpamClassifier {
             this.model.idf,
             this.words,
             this.model.wordIdf ?? [],
+            trace,
           )
-        : vectorize(text, this.vocabulary, this.model.idf);
+        : trace
+          ? trace.run(
+              'char_tfidf',
+              () => vectorize(text, this.vocabulary, this.model.idf),
+              (v) => ({
+                nonzero_features: v.length,
+                vocabulary_size: this.vocabulary.size,
+                spam_score: null,
+                reason: 'feature_extractor_not_classifier',
+              }),
+            )
+          : vectorize(text, this.vocabulary, this.model.idf);
+    if (this.model.format === 1) {
+      trace?.skip('word_tfidf', 'legacy_model');
+      trace?.skip('numeric_features', 'legacy_model');
+    }
     // Legacy models abstain on OOV; format 2 can still use numeric evidence.
-    return vector.length ? probability(vector, this.model.weights, this.model.intercept) : null;
+    if (!vector.length) {
+      trace?.skip('logistic_regression', 'empty_vector');
+      return null;
+    }
+    if (!trace) return probability(vector, this.model.weights, this.model.intercept);
+    const score = trace.run(
+      'logistic_regression',
+      () => probability(vector, this.model.weights, this.model.intercept),
+      (value) => scoreResult(value, 'uncalibrated_logistic'),
+    );
+    trace.run(
+      'logit_attribution',
+      () => {
+        const sums = {
+          char_tfidf: 0,
+          word_tfidf: 0,
+          numeric_features: 0,
+          intercept: this.model.intercept,
+        };
+        for (const [index, value] of vector) {
+          const block =
+            index < this.vocabulary.size
+              ? 'char_tfidf'
+              : index < this.vocabulary.size + this.words.size
+                ? 'word_tfidf'
+                : 'numeric_features';
+          sums[block] += value * (this.model.weights[index] ?? 0);
+        }
+        return sums;
+      },
+      (v) => ({
+        logit_contributions: v,
+        interpretation: 'additive_log_odds_not_independent_predictions',
+      }),
+    );
+    return score;
   }
 
   /** L2-normalized char TF-IDF in this model's frozen training vocabulary. */
@@ -215,16 +318,38 @@ export class SpamClassifier {
     return vectorize(normalizedText, this.vocabulary, this.model.idf, counts);
   }
 
-  assess(rawText: string, entities: readonly Entity[] = []) {
-    const classifierScore = this.classify(rawText, entities);
+  assess(rawText: string, entities: readonly Entity[] = [], trace?: InferenceTrace) {
+    const classifierScore = this.classify(rawText, entities, trace);
+    let markovDetails: Record<string, unknown> = {};
     const markovScore =
       classifierScore === null
         ? null
-        : (this.markov?.score(normalizeMessage(rawText).normalizedText) ?? null);
+        : trace && this.markov
+          ? trace.run(
+              'markov',
+              () =>
+                this.markov?.score(normalizeMessage(rawText).normalizedText, (details) => {
+                  markovDetails = details;
+                }) ?? null,
+              (v) => ({ ...scoreResult(v, 'markov_likelihood_signal'), ...markovDetails }),
+            )
+          : (this.markov?.score(normalizeMessage(rawText).normalizedText) ?? null);
+    if (!this.markov || classifierScore === null)
+      trace?.skip('markov', !this.markov ? 'legacy_model' : 'no_classifier_score');
+    const finalScore = trace
+      ? trace.run(
+          'lr_markov_blend',
+          () => combineScores(classifierScore, markovScore),
+          (v) => ({
+            ...scoreResult(v, 'lr_markov_ensemble'),
+            weights: markovScore === null ? { lr: 1, markov: 0 } : { lr: 0.9, markov: 0.1 },
+          }),
+        )
+      : combineScores(classifierScore, markovScore);
     return {
       classifierScore,
       markovScore,
-      finalScore: combineScores(classifierScore, markovScore),
+      finalScore,
     };
   }
 }

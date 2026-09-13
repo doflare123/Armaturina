@@ -108,9 +108,12 @@ export class MarkovSignal {
     });
   }
   /** Mean log likelihood avoids underflow and dependence on message length. */
-  score(text: string): number | null {
+  score(text: string, inspect?: (details: Record<string, unknown>) => void): number | null {
     const chars = Array.from(text).map((c) => (this.alphabet.has(c) ? c : UNKNOWN));
-    if (chars.length <= 3) return null;
+    if (chars.length <= 3) {
+      inspect?.({ transitions: 0, reason: 'text_too_short' });
+      return null;
+    }
     const likelihood = this.tables.map((table) => {
       let sum = 0;
       for (let i = 3; i < chars.length; i++) {
@@ -123,6 +126,15 @@ export class MarkovSignal {
       return sum / (chars.length - 3);
     });
     const d = (likelihood[0] ?? 0) - (likelihood[1] ?? 0);
+    inspect?.({
+      order: 3,
+      alpha: 1,
+      transitions: chars.length - 3,
+      alphabet_size: this.alphabet.size + 1,
+      mean_log_likelihood_spam: likelihood[0],
+      mean_log_likelihood_normal: likelihood[1],
+      log_likelihood_ratio_per_transition: d,
+    });
     return d >= 0 ? 1 / (1 + Math.exp(-d)) : Math.exp(d) / (1 + Math.exp(d));
   }
 }

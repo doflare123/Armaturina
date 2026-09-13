@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -7,6 +7,7 @@ import { ActiveSafety } from './active.ts';
 import { type PredictionPolicy, SpamGovernance } from './governance.ts';
 import { type ModelArtifact, type Sample, validateModel } from './model.ts';
 import { normalizeMessage } from './normalizer.ts';
+import type { InferenceTrace, ResearchTrace } from './trace.ts';
 
 export type Verdict = 'spam' | 'normal' | 'skip';
 export interface ReviewCase {
@@ -45,7 +46,8 @@ export class SpamStore {
         version !== 5 &&
         version !== 6 &&
         version !== 7 &&
-        version !== 8
+        version !== 8 &&
+        version !== 9
       )
         throw new Error('Unsupported antispam schema version');
       if (version === 0) this.migrate();
@@ -79,6 +81,14 @@ export class SpamStore {
         PRAGMA user_version=6; COMMIT;`);
       if (Number(version) < 7) SpamGovernance.migrate(this.db);
       if (Number(version) < 8) ActiveSafety.migrate(this.db);
+      if (Number(version) < 9)
+        this.db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS inference_traces (
+          id TEXT PRIMARY KEY,message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          prediction_id INTEGER UNIQUE REFERENCES predictions(id) ON DELETE SET NULL,
+          model_version TEXT REFERENCES model_versions(version),started_at INTEGER NOT NULL,payload_json TEXT NOT NULL);
+        CREATE UNIQUE INDEX IF NOT EXISTS trace_message_model ON inference_traces(message_id,COALESCE(model_version,''));
+        PRAGMA user_version=9; COMMIT;`);
       this.governance = new SpamGovernance(this.db);
     } catch (error) {
       this.db.close();
@@ -282,6 +292,107 @@ export class SpamStore {
 
   hasPrediction(messageId: number): boolean {
     return !!this.db.prepare('SELECT 1 FROM predictions WHERE message_id=?').get(messageId);
+  }
+
+  exactEvidence(messageId: number) {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS matches,
+      COUNT(CASE WHEN l.label=1 AND l.source IN ('ADMIN_CONFIRMED','ADMIN_REJECTED','BOOTSTRAP') THEN 1 END) AS spam,
+      COUNT(CASE WHEN l.label=0 AND l.source IN ('ADMIN_CONFIRMED','ADMIN_REJECTED','BOOTSTRAP') THEN 1 END) AS normal
+      FROM messages current JOIN messages other ON other.chat_id=current.chat_id AND other.text_hash=current.text_hash
+      LEFT JOIN labels l ON l.message_id=other.id
+      WHERE current.id=? AND other.id<>current.id AND (other.source_message_id IS NULL OR other.source_message_id<>current.source_message_id)`)
+      .get(messageId) as { matches: number; spam: number; normal: number };
+    return {
+      match_kind: 'normalized_text_sha256',
+      match_found: row.matches > 0,
+      match_score: row.matches ? 1 : 0,
+      matching_snapshots: row.matches,
+      confirmed_spam: row.spam,
+      confirmed_normal: row.normal,
+      conflicting_labels: row.spam > 0 && row.normal > 0,
+      terminal: false,
+      used_in_decision: false,
+      reason: 'diagnostic_evidence_current_pipeline_does_not_short_circuit',
+    };
+  }
+
+  researchSnapshot(messageId: number, model?: ModelArtifact) {
+    const row = this.db
+      .prepare('SELECT chat_id,text_hash,reduced_text FROM messages WHERE id=?')
+      .get(messageId);
+    if (!row) throw new Error('Message missing');
+    const hashes = model ? [...model.trainHashes, ...model.validationHashes] : [];
+    const reducedSeen = model
+      ? !!this.db
+          .prepare(`SELECT 1 FROM messages WHERE chat_id=? AND reduced_text=?
+      AND text_hash IN (SELECT value FROM json_each(?)) LIMIT 1`)
+          .get(Number(row.chat_id), String(row.reduced_text), JSON.stringify(hashes))
+      : null;
+    return {
+      dataset_size: model ? model.spamSamples + model.normalSamples : null,
+      train_size: model?.trainHashes.length ?? null,
+      validation_size: model?.validationHashes.length ?? null,
+      dataset_spam: model?.spamSamples ?? null,
+      dataset_normal: model?.normalSamples ?? null,
+      model_format: model?.format ?? null,
+      normalizer_version: 1,
+      context_policy_version: 1,
+      seen_in_training_or_validation: model
+        ? hashes.includes(String(row.text_hash)) || reducedSeen
+        : false,
+      duplicate_group: createHash('sha256').update(String(row.reduced_text)).digest('hex'),
+    };
+  }
+
+  saveTrace(messageId: number, trace: InferenceTrace) {
+    this.db
+      .prepare(`INSERT INTO inference_traces VALUES (?,?,?,?,?,?) ON CONFLICT DO UPDATE SET
+      prediction_id=excluded.prediction_id,payload_json=excluded.payload_json WHERE inference_traces.id=excluded.id`)
+      .run(
+        trace.id,
+        messageId,
+        trace.predictionId,
+        trace.modelVersion,
+        trace.startedAt,
+        JSON.stringify(trace.finish()),
+      );
+  }
+
+  *researchRows(chatId: number, limit = 10000, includeText = false) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100000)
+      throw new Error('Export limit must be 1..100000');
+    const exportedAt = new Date().toISOString();
+    const rows = this.db
+      .prepare(`SELECT t.*,m.chat_id,COALESCE(m.telegram_message_id,m.source_message_id) AS telegram_id,
+      m.revision,m.created_at,m.raw_text,l.label,l.source,l.created_at AS labelled_at,
+      a.status AS deletion_status FROM inference_traces t JOIN messages m ON m.id=t.message_id
+      LEFT JOIN labels l ON l.message_id=m.id LEFT JOIN active_actions a ON a.prediction_id=t.prediction_id
+      WHERE m.chat_id=? ORDER BY t.started_at DESC,t.id DESC LIMIT ?`)
+      .iterate(chatId, limit);
+    for (const row of rows) {
+      const human = row.source === 'ADMIN_CONFIRMED' || row.source === 'ADMIN_REJECTED';
+      const label = human ? (row.label === 1 ? 'spam' : 'normal') : null;
+      const payload = JSON.parse(String(row.payload_json)) as ResearchTrace;
+      yield {
+        ...payload,
+        predicted_label: payload.outcome.predicted_label ?? null,
+        final_spam_score: payload.outcome.spam_score ?? null,
+        final_normal_score: payload.outcome.normal_score ?? null,
+        chat_id: row.chat_id,
+        database_message_id: row.message_id,
+        message_id: row.telegram_id,
+        revision: row.revision,
+        message_created_at: new Date(Number(row.created_at)).toISOString(),
+        true_label: label,
+        true_label_source: human ? row.source : null,
+        labelled_at: human ? new Date(Number(row.labelled_at)).toISOString() : null,
+        label_is_prospective: human && Number(row.labelled_at) >= Number(row.started_at),
+        exported_at: exportedAt,
+        deletion_status: row.deletion_status ?? null,
+        ...(includeText ? { raw_text: row.raw_text } : {}),
+      };
+    }
   }
 
   canPropose(chatId: number, now = Date.now()): boolean {

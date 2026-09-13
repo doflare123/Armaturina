@@ -8,6 +8,7 @@ import { LearningService } from './learning.ts';
 import type { SpamClassifier } from './model.ts';
 import { ContextSignals, contextualScore } from './signals.ts';
 import { SpamStore, type Verdict } from './store.ts';
+import { InferenceTrace, scoreResult } from './trace.ts';
 
 function formatQuality(metrics: ReturnType<typeof quality>): string {
   const pct = (value: number | null) => (value === null ? '—' : `${(value * 100).toFixed(1)}%`);
@@ -360,68 +361,230 @@ export class SpamTelegram {
   private async suggest(message: Message, messageId: number) {
     this.store.observe(message, messageId);
     if (this.store.hasPrediction(messageId)) return;
-    const current = this.learning.current(message.chat.id);
-    if (!current) return;
-    const assessment = current.classifier.assess(
-      message.text ?? message.caption ?? '',
-      message.entities ?? message.caption_entities ?? [],
-    );
-    let protectedUser = true;
+    const trace = new InferenceTrace();
     try {
-      const member = await this.api.getChatMember(message.chat.id, message.from?.id ?? 0);
-      protectedUser = member.status === 'administrator' || member.status === 'creator';
+      const current = trace.run(
+        'model_loading',
+        () => this.learning.current(message.chat.id),
+        (v) => ({ available: !!v, version: v?.version ?? null }),
+      );
+      trace.modelVersion = current?.version ?? null;
+      trace.metadata = trace.run('research_snapshot', () =>
+        this.store.researchSnapshot(messageId, current?.classifier.model),
+      );
+      trace.run(
+        'sha256_lookup',
+        () => this.store.exactEvidence(messageId),
+        (v) => v,
+      );
+      if (!current) {
+        for (const stage of [
+          'normalization',
+          'char_tfidf',
+          'word_tfidf',
+          'numeric_features',
+          'logistic_regression',
+          'markov',
+          'lr_markov_blend',
+          'similarity',
+          'campaigns',
+          'behavior',
+          'final_ensemble',
+          'decision',
+        ])
+          trace.skip(stage, 'cold_start_no_model');
+        trace.outcome = { status: 'cold_start', action: 'none', predicted_label: null };
+        return;
+      }
+      const assessment = current.classifier.assess(
+        message.text ?? message.caption ?? '',
+        message.entities ?? message.caption_entities ?? [],
+        trace,
+      );
+      let protectedUser = true;
+      try {
+        const member = await trace.wait(
+          'telegram_permissions',
+          () => this.api.getChatMember(message.chat.id, message.from?.id ?? 0),
+          (v) => ({ status: v.status }),
+        );
+        protectedUser = member.status === 'administrator' || member.status === 'creator';
+      } catch {
+        /* Unknown permissions suppress suggestions. */
+      }
+      // A worker or another connection may activate/rollback a model while Telegram is awaited.
+      if (this.store.activeModel(message.chat.id)?.version !== current.version) {
+        trace.outcome = { status: 'model_changed', action: 'none' };
+        return;
+      }
+      let engine = this.signals.get(current.classifier);
+      if (!engine) {
+        engine = new ContextSignals(current.classifier);
+        this.signals.set(current.classifier, engine);
+      }
+      const now = Date.now();
+      const context = trace.run(
+        'context_database',
+        () =>
+          this.store.signalContext(message.chat.id, message.from?.id ?? 0, message.message_id, now),
+        (v) => ({ references: v.references.length, recent_messages: v.recent.length }),
+      );
+      const signals = engine.assess(
+        message.text ?? message.caption ?? '',
+        message.entities ?? message.caption_entities ?? [],
+        message.from?.id ?? 0,
+        now,
+        context,
+        trace,
+      );
+      const score = trace.run(
+        'final_ensemble',
+        () => contextualScore(assessment.finalScore, signals),
+        (v) => scoreResult(v, 'heuristic_ensemble'),
+      );
+      const policy = trace.run(
+        'runtime_policy',
+        () => this.store.governance.policy(message.chat.id, current.version),
+        (v) => ({ ...v }),
+      );
+      trace.metadata = {
+        ...trace.metadata,
+        mode: policy.mode,
+        threshold: policy.threshold,
+        protected_user: protectedUser,
+      };
+      trace.run(
+        'diagnostic_ablations',
+        () => ({
+          lr: assessment.classifierScore,
+          lr_markov: assessment.finalScore,
+          lr_markov_similarity: contextualScore(assessment.finalScore, {
+            ...signals,
+            campaignScore: 0,
+            behaviorScore: 0,
+          }),
+          lr_markov_similarity_campaign: contextualScore(assessment.finalScore, {
+            ...signals,
+            behaviorScore: 0,
+          }),
+          full: score,
+          without_markov: contextualScore(assessment.classifierScore, signals),
+          without_similarity: contextualScore(assessment.finalScore, {
+            ...signals,
+            spamSimilarity: null,
+          }),
+          without_campaign: contextualScore(assessment.finalScore, {
+            ...signals,
+            campaignScore: 0,
+          }),
+          without_behavior: contextualScore(assessment.finalScore, {
+            ...signals,
+            behaviorScore: 0,
+          }),
+        }),
+        (v) => ({
+          scores: v,
+          threshold: policy.threshold,
+          interpretation: 'fixed_weights_no_retraining_counterfactual_scores_not_causal_effects',
+        }),
+      );
+      const result = trace.run(
+        'decision',
+        () => {
+          const decision = decide(score, protectedUser, policy.threshold);
+          if (decision.decision === 'ASK_ADMIN' && (assessment.finalScore ?? 0) < policy.threshold)
+            decision.reason = 'context_above_review_threshold';
+          return decision;
+        },
+        (v) => ({ ...v, ...scoreResult(score, 'heuristic_ensemble', policy.threshold) }),
+      );
+      const limited =
+        policy.mode !== 'SHADOW' &&
+        result.decision === 'ASK_ADMIN' &&
+        !this.store.canPropose(message.chat.id);
+      const predictionId = trace.run(
+        'prediction_database',
+        () =>
+          this.store.prediction(
+            messageId,
+            current.version,
+            assessment.classifierScore,
+            result.decision,
+            limited ? 'review_rate_limited' : result.reason,
+            assessment.markovScore,
+            score,
+            signals,
+            policy,
+          ),
+        (v) => ({ prediction_id: v }),
+      );
+      trace.predictionId = predictionId;
+      trace.outcome = {
+        status: 'completed',
+        action: 'none',
+        decision: result.decision,
+        reason: limited ? 'review_rate_limited' : result.reason,
+        predicted_label: score === null ? null : score >= policy.threshold ? 'spam' : 'normal',
+        spam_score: score,
+        normal_score: score === null ? null : 1 - score,
+        threshold: policy.threshold,
+      };
+      if (predictionId === null) {
+        trace.outcome.status = 'duplicate_or_stale';
+        return;
+      }
+      // Preserve a partial trace if the process dies during the external side effect.
+      const checkpointStatus = trace.outcome.status;
+      trace.outcome.status = 'action_pending';
+      this.persistTrace(messageId, trace);
+      trace.outcome.status = checkpointStatus;
+      if (
+        activeAction(score, protectedUser, policy.threshold, policy.mode === 'ACTIVE') === 'DELETE'
+      ) {
+        trace.outcome.action = await trace.wait(
+          'active_action',
+          () => this.deleteActive(message, messageId, predictionId, current.version),
+          (v) => ({ result: v }),
+        );
+        return;
+      }
+      if (policy.mode === 'SHADOW' || limited || result.decision !== 'ASK_ADMIN') {
+        trace.skip(
+          'telegram_review_card',
+          policy.mode === 'SHADOW'
+            ? 'shadow_mode'
+            : limited
+              ? 'rate_limited'
+              : 'below_threshold_or_protected',
+        );
+        return;
+      }
+      const item = this.store.createCase(messageId, Date.now(), predictionId);
+      if (item.card_id !== null || item.status !== 'PENDING') return;
+      await trace.wait(
+        'telegram_review_card',
+        () =>
+          this.sendCard(
+            item,
+            `Возможный спам — нужна проверка администратора.\nПриоритет проверки: ${((score ?? 0) * 100).toFixed(1)}/100 (не вероятность).\nКлассификатор: ${((assessment.classifierScore ?? 0) * 100).toFixed(1)}%\nMarkov: ${assessment.markovScore === null ? 'нет оценки' : `${(assessment.markovScore * 100).toFixed(1)}%`}\nSimilarity spam/normal: ${signals.spamSimilarity?.toFixed(2) ?? '—'}/${signals.normalSimilarity?.toFixed(2) ?? '—'}\nПохожих авторов за 10 мин: ${signals.campaignUsers}; сообщений автора за 60 с: ${signals.messagesLast60s}\nПоведение: ${signals.behaviorScore.toFixed(2)}; общих URL с другими авторами: ${signals.sameUrlOtherUsers}\nМодель: ${current.version}`,
+          ),
+        () => ({ sent: true }),
+      );
+      trace.outcome.action = 'admin_review_card';
+    } catch (error) {
+      trace.outcome = { ...trace.outcome, status: 'error' };
+      throw error;
+    } finally {
+      this.persistTrace(messageId, trace);
+    }
+  }
+
+  private persistTrace(messageId: number, trace: InferenceTrace) {
+    try {
+      this.store.saveTrace(messageId, trace);
     } catch {
-      /* Unknown permissions suppress suggestions. */
+      console.error('antispam_trace_write_failed');
     }
-    // A worker or another connection may activate/rollback a model while Telegram is awaited.
-    if (this.store.activeModel(message.chat.id)?.version !== current.version) return;
-    let engine = this.signals.get(current.classifier);
-    if (!engine) {
-      engine = new ContextSignals(current.classifier);
-      this.signals.set(current.classifier, engine);
-    }
-    const now = Date.now();
-    const signals = engine.assess(
-      message.text ?? message.caption ?? '',
-      message.entities ?? message.caption_entities ?? [],
-      message.from?.id ?? 0,
-      now,
-      this.store.signalContext(message.chat.id, message.from?.id ?? 0, message.message_id, now),
-    );
-    const score = contextualScore(assessment.finalScore, signals);
-    const policy = this.store.governance.policy(message.chat.id, current.version);
-    const result = decide(score, protectedUser, policy.threshold);
-    if (result.decision === 'ASK_ADMIN' && (assessment.finalScore ?? 0) < policy.threshold)
-      result.reason = 'context_above_review_threshold';
-    const limited =
-      policy.mode !== 'SHADOW' &&
-      result.decision === 'ASK_ADMIN' &&
-      !this.store.canPropose(message.chat.id);
-    const predictionId = this.store.prediction(
-      messageId,
-      current.version,
-      assessment.classifierScore,
-      result.decision,
-      limited ? 'review_rate_limited' : result.reason,
-      assessment.markovScore,
-      score,
-      signals,
-      policy,
-    );
-    if (predictionId === null) return;
-    if (
-      activeAction(score, protectedUser, policy.threshold, policy.mode === 'ACTIVE') === 'DELETE'
-    ) {
-      await this.deleteActive(message, messageId, predictionId, current.version);
-      return;
-    }
-    if (policy.mode === 'SHADOW' || limited || result.decision !== 'ASK_ADMIN') return;
-    const item = this.store.createCase(messageId, Date.now(), predictionId);
-    if (item.card_id !== null || item.status !== 'PENDING') return;
-    await this.sendCard(
-      item,
-      `Возможный спам — нужна проверка администратора.\nПриоритет проверки: ${((score ?? 0) * 100).toFixed(1)}/100 (не вероятность).\nКлассификатор: ${((assessment.classifierScore ?? 0) * 100).toFixed(1)}%\nMarkov: ${assessment.markovScore === null ? 'нет оценки' : `${(assessment.markovScore * 100).toFixed(1)}%`}\nSimilarity spam/normal: ${signals.spamSimilarity?.toFixed(2) ?? '—'}/${signals.normalSimilarity?.toFixed(2) ?? '—'}\nПохожих авторов за 10 мин: ${signals.campaignUsers}; сообщений автора за 60 с: ${signals.messagesLast60s}\nПоведение: ${signals.behaviorScore.toFixed(2)}; общих URL с другими авторами: ${signals.sameUrlOtherUsers}\nМодель: ${current.version}`,
-    );
   }
 
   private async canDelete(chatId: number): Promise<boolean> {
@@ -445,7 +608,8 @@ export class SpamTelegram {
   ) {
     const safety = this.store.governance.active;
     const grant = safety.grant(message.chat.id, version);
-    if (!grant || !message.from || message.from.is_bot || message.sender_chat) return;
+    if (!grant || !message.from || message.from.is_bot || message.sender_chat)
+      return 'skipped_no_grant_or_protected';
     try {
       const [allowed, administrator, target] = await Promise.all([
         this.canDelete(message.chat.id),
@@ -454,25 +618,27 @@ export class SpamTelegram {
       ]);
       if (!allowed || !administrator) {
         safety.revoke(message.chat.id, 'permissions_changed');
-        return;
+        return 'skipped_permissions_changed';
       }
       if (target.user.is_bot || target.status === 'administrator' || target.status === 'creator')
-        return;
+        return 'skipped_protected_author';
     } catch {
       safety.revoke(message.chat.id, 'permission_check_failed');
-      return;
+      return 'skipped_permission_check_failed';
     }
     // No await between the final local guards, durable claim and Telegram request.
     const live = safety.grant(message.chat.id, version);
     if (!live || live.evaluation_id !== grant.evaluation_id || !this.store.isCurrent(messageId))
-      return;
-    if (!safety.claim(predictionId, live)) return;
+      return 'skipped_grant_or_revision_changed';
+    if (!safety.claim(predictionId, live)) return 'skipped_rate_limit_existing_review_or_claim';
     try {
       await this.api.deleteMessage(message.chat.id, message.message_id);
       safety.finish(predictionId, 'DELETED');
+      return 'deleted';
     } catch {
       safety.finish(predictionId, 'FAILED_OR_UNKNOWN');
       safety.revoke(message.chat.id, 'delete_failed_or_unknown');
+      return 'failed_or_unknown';
     }
   }
 
