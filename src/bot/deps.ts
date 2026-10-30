@@ -4,6 +4,7 @@ import type { AdminChecker } from '../services/admin.ts';
 import type { GeminiService } from '../services/gemini.ts';
 import type { FileStore } from '../store/fileStore.ts';
 import type { Config } from '../types.ts';
+import type { CommandQueue } from './commandQueue.ts';
 
 /** Everything the message handlers need, assembled once by {@link createBot}. */
 export interface BotDeps {
@@ -12,6 +13,7 @@ export interface BotDeps {
   store: FileStore;
   gemini: GeminiService;
   admins: AdminChecker;
+  commands?: CommandQueue;
   /** Cached `getMe`, so moderation checks don't re-hit the API. */
   getBotInfo(): Promise<UserFromGetMe>;
 }

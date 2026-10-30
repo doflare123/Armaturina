@@ -2,7 +2,8 @@ import type { Message } from 'grammy/types';
 import { NON_ADMIN_BAN_REPLIES, NON_ADMIN_HIT_REPLIES } from '../messages.ts';
 import { parseAction } from '../parser/index.ts';
 import { isGroupChat } from '../services/admin.ts';
-import type { Action } from '../types.ts';
+import type { Action, Target } from '../types.ts';
+import { withModerationPriority } from './apiQueue.ts';
 import type { BotDeps } from './deps.ts';
 import { handleHit } from './handlers/hit.ts';
 import {
@@ -29,18 +30,52 @@ export async function handleMessage(deps: BotDeps, message: Message): Promise<vo
 
   const action = parseAction(message);
 
-  if (isPublicAction(action)) {
-    await handlePublicAction(deps, message, action);
+  if (deps.commands && (action.type === 'lef' || action.type === 'hit')) {
+    // Resolve before remembering this command or accepting newer messages.
+    const target = snapshotTarget(deps, message.chat.id, action.target, action.type === 'hit');
+    const queued: Action =
+      action.type === 'hit'
+        ? { ...action, target: target ?? action.target }
+        : { ...action, target };
+    deps.commands.enqueue(message.chat.id, () => handleAction(deps, message, queued));
     deps.store.rememberMessage(message);
     return;
   }
 
-  if (action.type !== 'none') {
-    await handleAdminAction(deps, message, action);
+  await handleAction(deps, message, action);
+  deps.store.rememberMessage(message);
+}
+
+function snapshotTarget(
+  deps: BotDeps,
+  chatId: number,
+  target: Target | null,
+  requireMessage: boolean,
+): Target | null {
+  if (!target || target.messageId) return target;
+  const last = deps.store.getLastMessage(chatId, target);
+  return {
+    ...target,
+    messageId: last?.messageId ?? null,
+    userId: requireMessage && !last ? null : (target.userId ?? last?.userId ?? null),
+    username: last?.username ?? null,
+    text: last?.text ?? '',
+  };
+}
+
+async function handleAction(deps: BotDeps, message: Message, action: Action): Promise<void> {
+  if (isPublicAction(action)) {
+    await handlePublicAction(deps, message, action);
+    return;
   }
 
-  // Remember after handling so an admin command never overwrites the target's history first.
-  deps.store.rememberMessage(message);
+  if (action.type !== 'none') {
+    if (action.type === 'mute' || action.type === 'ban') {
+      await withModerationPriority(() => handleAdminAction(deps, message, action));
+    } else {
+      await handleAdminAction(deps, message, action);
+    }
+  }
 }
 
 function isPublicAction(action: Action): action is PublicAction {
